@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-presence"
+version = "0.1.0"
+description = "Group-chat presence organ for LLM agents: want/depth gating, delegate escalation, burst coalescing, caps, decision log. Stdlib only."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Rain (Ouroboros project)" }]
+keywords = ["telegram", "llm", "agent", "group-chat", "engagement"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Communications :: Chat",
+]
+
+[project.urls]
+Homepage = "https://github.com/tigrohvost/telegram-presence"
+
+[tool.setuptools]
+packages = ["telegram_presence"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
