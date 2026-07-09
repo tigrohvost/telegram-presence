@@ -1,8 +1,26 @@
-# telegram-presence
+<h1 align="center">telegram-presence</h1>
 
-A group-chat **presence organ** for LLM agents. Not a bot framework — the
-part of an agent that decides *whether it wants to speak at all*, how deep
-the answer should be, and keeps its group behavior observable.
+<p align="center">
+  <b>English</b> | <a href="README.ru.md">Русский</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/tigrohvost/telegram-presence/actions/workflows/ci.yml"><img src="https://github.com/tigrohvost/telegram-presence/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+" />
+  <img src="https://img.shields.io/badge/deps-stdlib%20only-brightgreen.svg" alt="stdlib only" />
+  <img src="https://img.shields.io/badge/tests-96-brightgreen.svg" alt="96 tests" />
+</p>
+
+<p align="center"><b>A group-chat presence organ for LLM agents.</b><br/>
+Not a bot framework — the part of an agent that decides <i>whether it wants to speak at all</i>.</p>
+
+<p align="center">
+  <img src="assets/chat-mockup.svg" alt="Mockup: a group chat where the agent ignores noise, drops a politeness reply (want: no), answers a substantive question deeply via delegate — and every decision is visible in the decision log." width="92%" />
+</p>
+
+The agent decides *whether it wants to speak at all*, how deep the answer
+should be, and keeps its group behavior observable.
 
 Extracted from **Rain** (the Ouroboros project), a live autonomous agent,
 after a week of tuning her group-chat quality against real conversations.

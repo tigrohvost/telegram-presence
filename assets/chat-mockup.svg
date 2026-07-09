@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="640" viewBox="0 0 880 640" font-family="-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14">
+  <!-- ===== Telegram-style chat window (mockup) ===== -->
+  <rect x="8" y="8" width="864" height="420" rx="12" fill="#17212b" stroke="#30363d"/>
+  <!-- header -->
+  <rect x="8" y="8" width="864" height="46" rx="12" fill="#242f3d"/>
+  <rect x="8" y="42" width="864" height="12" fill="#242f3d"/>
+  <circle cx="40" cy="31" r="14" fill="#5288c1"/>
+  <text x="40" y="36" text-anchor="middle" fill="#fff" font-weight="bold" font-size="13">G</text>
+  <text x="64" y="27" fill="#f5f5f5" font-weight="bold" font-size="14">Group chat</text>
+  <text x="64" y="44" fill="#708499" font-size="12">mockup — telegram-presence in action</text>
+
+  <!-- msg 1: noise -->
+  <circle cx="42" cy="92" r="15" fill="#c46f4d"/>
+  <text x="42" y="97" text-anchor="middle" fill="#fff" font-size="12">M</text>
+  <rect x="66" y="72" width="250" height="40" rx="10" fill="#182533"/>
+  <text x="80" y="89" fill="#7bb2e0" font-size="12" font-weight="bold">Misha</text>
+  <text x="80" y="105" fill="#dfe4e8">ахахах ну и денёк 😅</text>
+  <!-- decision annotation -->
+  <text x="330" y="98" fill="#708499" font-size="12" font-style="italic">→ ignore (не адресовано, нечего добавить)</text>
+
+  <!-- msg 2: politeness bait -->
+  <circle cx="42" cy="146" r="15" fill="#7a5cc4"/>
+  <text x="42" y="151" text-anchor="middle" fill="#fff" font-size="12">O</text>
+  <rect x="66" y="126" width="330" height="40" rx="10" fill="#182533"/>
+  <text x="80" y="143" fill="#b18ae0" font-size="12" font-weight="bold">Olya</text>
+  <text x="80" y="159" fill="#dfe4e8">Rain, ну ты как, живая? 🙂</text>
+  <text x="410" y="152" fill="#e0b34d" font-size="12" font-style="italic">→ want: no — дроп (вежливость ≠ повод писать)</text>
+
+  <!-- msg 3: substantive burst -->
+  <circle cx="42" cy="204" r="15" fill="#4d9e78"/>
+  <text x="42" y="209" text-anchor="middle" fill="#fff" font-size="12">A</text>
+  <rect x="66" y="184" width="470" height="58" rx="10" fill="#182533"/>
+  <text x="80" y="201" fill="#7fd0a0" font-size="12" font-weight="bold">Anatoli</text>
+  <text x="80" y="218" fill="#dfe4e8">@rain а как ты решаешь, когда отвечать в чате,</text>
+  <text x="80" y="235" fill="#dfe4e8">а когда промолчать? это же нетривиально</text>
+  <text x="550" y="212" fill="#7ee787" font-size="12" font-style="italic">→ want: yes, depth: deep</text>
+  <text x="550" y="228" fill="#7ee787" font-size="12" font-style="italic">→ delegate (полная модель + KB)</text>
+
+  <!-- Rain's reply with anchor quote -->
+  <rect x="286" y="256" width="560" height="120" rx="10" fill="#2b5278"/>
+  <!-- reply quote -->
+  <rect x="300" y="266" width="3" height="30" fill="#7bb2e0"/>
+  <text x="310" y="278" fill="#7bb2e0" font-size="12" font-weight="bold">Anatoli</text>
+  <text x="310" y="292" fill="#a8c4dd" font-size="12">@rain а как ты решаешь, когда отвечать…</text>
+  <text x="300" y="315" fill="#ffffff">Anatoli, у меня это два отдельных решения: сначала «хочу ли я</text>
+  <text x="300" y="333" fill="#ffffff">вообще отвечать» (want) — молчание допустимый ответ, — и только</text>
+  <text x="300" y="351" fill="#ffffff">потом «насколько глубоко» (depth). Твой вопрос прошёл оба гейта.</text>
+  <text x="806" y="368" fill="#7bb2e0" font-size="11">12:04 ✓✓</text>
+  <circle cx="860" cy="266" r="0" fill="none"/>
+
+  <!-- msg 4: quote-back, silence -->
+  <circle cx="42" cy="404" r="15" fill="#9e9e4d"/>
+  <text x="42" y="409" text-anchor="middle" fill="#fff" font-size="12">?</text>
+  <rect x="66" y="386" width="330" height="36" rx="10" fill="#182533"/>
+  <text x="80" y="401" fill="#d0cd7f" font-size="12" font-weight="bold">stranger</text>
+  <text x="80" y="416" fill="#8b98a5" font-style="italic">«молчание допустимый ответ» — цитирует Rain</text>
+  <text x="410" y="408" fill="#e0b34d" font-size="12" font-style="italic">→ want: no — своё же эхо, без ответа</text>
+
+  <!-- ===== decision log strip ===== -->
+  <rect x="8" y="444" width="864" height="188" rx="12" fill="#161b22" stroke="#30363d"/>
+  <rect x="8" y="444" width="864" height="30" rx="12" fill="#21262d"/>
+  <rect x="8" y="462" width="864" height="12" fill="#21262d"/>
+  <text x="24" y="464" fill="#8b949e" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="12">state/telegram_engage_decisions.jsonl — каждое решение наблюдаемо</text>
+  <g font-family="ui-monospace, Menlo, Consolas, monospace" font-size="12.5">
+    <text x="24" y="496" fill="#8b949e">{"mid": 101, "action": <tspan fill="#79c0ff">"ignore"</tspan>,  "want": "",    "reason": "unaddressed chatter"}</text>
+    <text x="24" y="520" fill="#8b949e">{"mid": 102, "action": <tspan fill="#79c0ff">"reply"</tspan>,   "want": <tspan fill="#e0b34d">"no"</tspan>,  <tspan fill="#e0b34d">→ dropped: want_no</tspan>}</text>
+    <text x="24" y="544" fill="#8b949e">{"mid": 103, "action": <tspan fill="#79c0ff">"reply"</tspan>,   "want": <tspan fill="#3fb950">"yes"</tspan>, "depth": <tspan fill="#3fb950">"deep"</tspan> <tspan fill="#3fb950">→ delegate</tspan>}</text>
+    <text x="24" y="568" fill="#8b949e">{"final": [{"mid": 103, "action": "reply", <tspan fill="#3fb950">"delegated": true</tspan>}]}</text>
+    <text x="24" y="592" fill="#8b949e">{"mid": 104, "action": <tspan fill="#79c0ff">"reply"</tspan>,   "want": <tspan fill="#e0b34d">"no"</tspan>,  <tspan fill="#e0b34d">→ dropped: own echo</tspan>}</text>
+    <text x="24" y="616" fill="#586069" font-style="italic"># 4 сообщения → 1 ответ. Отвечает, когда есть что сказать — не из вежливости.</text>
+  </g>
+</svg>
