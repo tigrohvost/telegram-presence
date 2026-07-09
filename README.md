@@ -9,7 +9,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+" />
   <img src="https://img.shields.io/badge/deps-stdlib%20only-brightgreen.svg" alt="stdlib only" />
-  <img src="https://img.shields.io/badge/tests-96-brightgreen.svg" alt="96 tests" />
+  <img src="https://img.shields.io/badge/tests-102-brightgreen.svg" alt="102 tests" />
 </p>
 
 <p align="center"><b>A group-chat presence organ for LLM agents.</b><br/>
@@ -92,6 +92,40 @@ result = run_telegram_engage_cycle(
 )
 ```
 
+## Transports — Bot API or Telethon
+
+The cycle only sees `do_reply` / `do_react` callables, so it runs over either
+client. Two adapters ship with the package (both covered by the test suite —
+same cycle, same anchored replies through each wire format):
+
+```python
+# Bot API (stdlib urllib, zero deps). Privacy mode must be OFF for the bot
+# to see the conversation (BotFather → /setprivacy), or make it an admin.
+from telegram_presence.transports.bot_api import BotApiTransport
+transport = BotApiTransport(token=BOT_TOKEN, inbox=inbox, self_id=bot_id)
+transport.poll_updates()                      # getUpdates → GroupInbox
+
+# Telethon (user account). The client is injected — this package never
+# imports telethon, so it stays stdlib-only and testable with a fake.
+from telegram_presence.transports.telethon import TelethonTransport
+transport = TelethonTransport(client=client, inbox=inbox,
+                              loop=client.loop, self_id=me.id)
+client.add_event_handler(transport.on_group_message,
+                         events.NewMessage(func=lambda e: e.is_group))
+```
+
+Then hand `transport.do_reply` / `transport.do_react` to
+`run_telegram_engage_cycle`. Reactions over Telethon need a
+`react_request` factory (raw `SendReactionRequest`); over Bot API they use
+`setMessageReaction` out of the box.
+
+## Use as an agent skill
+
+[`SKILL.md`](SKILL.md) packages this repo as an agent skill: when to reach
+for it, hook configuration, transport wiring, and the invariants an agent
+must not "optimize away" (silence is a valid answer; one chat-resolution
+point; group text stays untrusted).
+
 Chats are resolved in exactly one place — `inbox.allowed_chats()`
 (`TELEGRAM_MENTIONS_CHAT` env, then the host state's
 `telegram_mentions_chat` + `telegram_engage_chats`). An unconfigured stack
@@ -102,7 +136,7 @@ answer people from a retired chat.
 ## Tests
 
 ```
-python -m pytest tests/ -q     # 96 tests, no network, no Telegram account
+python -m pytest tests/ -q     # 102 tests, no network, no Telegram account
 ```
 
 ## License

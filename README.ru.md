@@ -9,7 +9,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+" />
   <img src="https://img.shields.io/badge/deps-stdlib%20only-brightgreen.svg" alt="stdlib only" />
-  <img src="https://img.shields.io/badge/tests-96-brightgreen.svg" alt="96 tests" />
+  <img src="https://img.shields.io/badge/tests-102-brightgreen.svg" alt="102 tests" />
 </p>
 
 <p align="center"><b>Орган присутствия в групповых чатах для LLM-агентов.</b><br/>
@@ -87,6 +87,40 @@ result = run_telegram_engage_cycle(
 )
 ```
 
+## Транспорты — Bot API или Telethon
+
+Цикл видит только колбэки `do_reply` / `do_react`, поэтому работает поверх
+любого клиента. В пакете два адаптера (оба покрыты тестами — один и тот же
+цикл, одинаково заанкоренные ответы через каждый протокол):
+
+```python
+# Bot API (stdlib urllib, ноль зависимостей). Privacy mode должен быть OFF,
+# чтобы бот видел разговор (BotFather → /setprivacy), либо сделайте бота админом.
+from telegram_presence.transports.bot_api import BotApiTransport
+transport = BotApiTransport(token=BOT_TOKEN, inbox=inbox, self_id=bot_id)
+transport.poll_updates()                      # getUpdates → GroupInbox
+
+# Telethon (пользовательский аккаунт). Клиент инъецируется — пакет сам
+# telethon не импортирует: остаётся stdlib-only и тестируется фейком.
+from telegram_presence.transports.telethon import TelethonTransport
+transport = TelethonTransport(client=client, inbox=inbox,
+                              loop=client.loop, self_id=me.id)
+client.add_event_handler(transport.on_group_message,
+                         events.NewMessage(func=lambda e: e.is_group))
+```
+
+Дальше отдайте `transport.do_reply` / `transport.do_react` в
+`run_telegram_engage_cycle`. Реакции через Telethon требуют фабрику
+`react_request` (сырой `SendReactionRequest`); через Bot API работают из
+коробки (`setMessageReaction`).
+
+## Как скилл агента
+
+[`SKILL.md`](SKILL.md) оформляет репозиторий как скилл: когда его брать,
+настройка hooks, подключение транспортов и инварианты, которые агент не
+должен «заоптимизировать» (молчание — валидный ответ; одна точка резолюции
+чатов; текст группы остаётся недоверенным).
+
 Чаты резолвятся ровно в одном месте — `inbox.allowed_chats()`
 (env `TELEGRAM_MENTIONS_CHAT`, затем `telegram_mentions_chat` +
 `telegram_engage_chats` из state хоста). Ненастроенный стек не обслуживает
@@ -97,7 +131,7 @@ result = run_telegram_engage_cycle(
 ## Тесты
 
 ```
-python -m pytest tests/ -q     # 96 тестов, без сети, без аккаунта Telegram
+python -m pytest tests/ -q     # 102 теста, без сети, без аккаунта Telegram
 ```
 
 ## Лицензия
