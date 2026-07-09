@@ -22,7 +22,7 @@ Not a bot framework — the part of an agent that decides <i>whether it wants to
 The agent decides *whether it wants to speak at all*, how deep the answer
 should be, and keeps its group behavior observable.
 
-Extracted from **Rain** (the Ouroboros project), a live autonomous agent,
+Made with **Rain**'s participation (the Ouroboros project), a live autonomous agent,
 after a week of tuning her group-chat quality against real conversations.
 Stdlib only, no Telegram library dependency: all I/O and LLM calls are
 injected callables.
