@@ -8,13 +8,25 @@ composer, coalesces message bursts, respects per-chat caps and pauses, and
 writes a decision log so under-delegation stays observable.
 
 Everything host-specific (LLM calls, Telegram I/O, persona, state store) is
-injected: see `telegram_presence.hooks.configure` and the callables taken by
-`telegram_presence.engage.run_telegram_engage_cycle`.
+injected. Reusable outbound primitives add correlated envelopes and a durable,
+bounded-retry outbox without importing Rain or a Telegram SDK.
 """
 from telegram_presence import hooks
+from telegram_presence.delivery import DeliveryRecord, DeliveryState, MessageEnvelope
 from telegram_presence.engage import run_telegram_engage_cycle
 from telegram_presence.inbox import GroupInbox, allowed_chats, matched_terms
+from telegram_presence.outbox import DurableOutbox
 
-__version__ = "0.1.0"
-__all__ = ["hooks", "run_telegram_engage_cycle", "GroupInbox",
-           "allowed_chats", "matched_terms", "__version__"]
+__version__ = "0.2.0"
+__all__ = [
+    "hooks",
+    "run_telegram_engage_cycle",
+    "GroupInbox",
+    "allowed_chats",
+    "matched_terms",
+    "MessageEnvelope",
+    "DeliveryRecord",
+    "DeliveryState",
+    "DurableOutbox",
+    "__version__",
+]

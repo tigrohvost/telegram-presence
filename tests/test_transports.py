@@ -6,10 +6,16 @@ tests prove each adapter (a) feeds group messages into GroupInbox and (b)
 performs an anchored reply and a reaction through its own wire format.
 """
 import asyncio
+import gc
 import json
+import threading
+import time
+import warnings
 
 from telegram_presence import hooks
+from telegram_presence.delivery import DeliveryState, MessageEnvelope
 from telegram_presence.inbox import GroupInbox
+from telegram_presence.outbox import DurableOutbox
 from telegram_presence.transports.bot_api import BotApiTransport
 from telegram_presence.transports.telethon import TelethonTransport
 from telegram_presence import engage as te
@@ -86,6 +92,110 @@ def test_bot_api_standalone_message_has_no_anchor(tmp_path):
     assert "reply_parameters" not in payload
 
 
+def test_bot_api_semantically_chunks_without_silent_truncation(tmp_path):
+    http = _FakeHttp([])
+    t = BotApiTransport(token="TESTTOKEN", inbox=GroupInbox(tmp_path), http=http)
+    text = ("слово " * 900).strip()
+    assert len(text) > 4096
+    assert t.do_reply("@examplechat", 42, text) is True
+    sends = [payload for url, payload in http.calls if "sendMessage" in url]
+    assert len(sends) == 2
+    assert all(len(payload["text"]) <= 4096 for payload in sends)
+    assert sends[0]["reply_parameters"]["message_id"] == 42
+    assert "reply_parameters" not in sends[1]
+    assert " ".join(payload["text"] for payload in sends) == text
+
+
+def test_bot_api_rejects_over_chunk_bound_before_transport_io(tmp_path):
+    http = _FakeHttp([])
+    t = BotApiTransport(token="TESTTOKEN", inbox=GroupInbox(tmp_path), http=http,
+                        max_text_chunks=1)
+    assert t.do_reply("@examplechat", 42, "x" * 5000) is False
+    assert http.calls == []
+
+
+def test_bot_api_partial_chunk_failure_retries_whole_envelope(tmp_path):
+    class _PartialHttp:
+        def __init__(self):
+            self.calls = []
+            self.accepted = []
+            self.fail_on = 2
+            self.send_count = 0
+
+        def __call__(self, url, data=None, timeout=None):
+            import io
+            payload = json.loads(data.decode("utf-8"))
+            self.calls.append((url, payload))
+            self.send_count += 1
+            if self.send_count == self.fail_on:
+                body = {"ok": False, "description": "temporary"}
+            else:
+                self.accepted.append(payload["text"])
+                body = {"ok": True, "result": {}}
+            return io.BytesIO(json.dumps(body).encode("utf-8"))
+
+    now = [0.0]
+    http = _PartialHttp()
+    transport = BotApiTransport(token="TESTTOKEN", inbox=GroupInbox(tmp_path / "inbox"),
+                                http=http)
+    outbox = DurableOutbox(tmp_path / "outbox", clock=lambda: now[0],
+                           base_retry_seconds=1)
+    text = ("слово " * 900).strip()
+    queued = outbox.enqueue(MessageEnvelope(
+        transport="bot_api", peer="@examplechat", kind="reply", text=text,
+        reply_to_message_id=42, idempotency_key="partial-prefix", created_at=0,
+    ))
+    assert outbox.dispatch_one(queued.delivery_id,
+                               transport.send_envelope).state == DeliveryState.FAILED
+    assert len(http.accepted) == 1
+
+    http.fail_on = None
+    now[0] = 1.0
+    assert outbox.dispatch_one(queued.delivery_id,
+                               transport.send_envelope).state == DeliveryState.ACKED
+    assert len(http.accepted) == 3
+    assert http.accepted[0] == http.accepted[1]  # at-least-once prefix duplicate
+
+
+def test_bot_api_exception_log_does_not_leak_token_or_url(tmp_path, caplog):
+    def failing_http(_url, data=None, timeout=None):
+        raise RuntimeError("SUPERSECRET exception detail")
+
+    transport = BotApiTransport(token="SUPERSECRET", inbox=GroupInbox(tmp_path),
+                                http=failing_http)
+    assert transport.do_reply("@examplechat", 42, "hello") is False
+    assert "SUPERSECRET" not in caplog.text
+    assert "api.telegram.org" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+def test_transport_timeouts_must_be_positive_and_finite(tmp_path):
+    import math
+    import pytest
+
+    for value in (0, -1, math.inf, math.nan, True):
+        with pytest.raises(ValueError):
+            BotApiTransport(token="T", inbox=GroupInbox(tmp_path / "b"), timeout=value)
+        with pytest.raises(ValueError):
+            TelethonTransport(client=_FakeTelethonClient(),
+                              inbox=GroupInbox(tmp_path / "t"), send_timeout=value)
+
+
+def test_bot_api_envelope_round_trip_through_durable_outbox(tmp_path):
+    http = _FakeHttp([])
+    transport = BotApiTransport(token="TESTTOKEN", inbox=GroupInbox(tmp_path / "inbox"),
+                                http=http)
+    outbox = DurableOutbox(tmp_path / "outbox")
+    queued = outbox.enqueue(MessageEnvelope(
+        transport="bot_api", peer="@examplechat", kind="reply", text="durable",
+        reply_to_message_id=42, idempotency_key="example-42",
+    ))
+    settled = outbox.dispatch_one(queued.delivery_id, transport.send_envelope)
+    assert settled.state == DeliveryState.ACKED
+    assert any(payload and payload.get("text") == "durable"
+               for _url, payload in http.calls)
+
+
 # --- Telethon ----------------------------------------------------------------
 
 class _FakeTelethonClient:
@@ -113,6 +223,72 @@ def test_telethon_reply_is_anchored(tmp_path):
         assert client.sent[-1] == ("entity:@examplechat", "standalone", None)
     finally:
         loop.close()
+
+
+def test_telethon_semantically_chunks_and_sends_envelope(tmp_path):
+    client = _FakeTelethonClient()
+    loop = asyncio.new_event_loop()
+    try:
+        t = TelethonTransport(client=client, inbox=GroupInbox(tmp_path), loop=loop)
+        text = ("слово " * 900).strip()
+        receipt = t.send_envelope(MessageEnvelope(
+            transport="telethon", peer="@examplechat", kind="reply", text=text,
+            reply_to_message_id=42,
+        ))
+        assert receipt.success is True
+        assert len(client.sent) == 2
+        assert client.sent[0][2] == 42 and client.sent[1][2] is None
+        assert " ".join(item[1] for item in client.sent) == text
+    finally:
+        loop.close()
+
+
+def test_telethon_sync_send_on_running_loop_fails_without_ghost_send(tmp_path):
+    client = _FakeTelethonClient()
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        t = TelethonTransport(client=client, inbox=GroupInbox(tmp_path), loop=loop,
+                              send_timeout=0.01)
+        assert t.do_reply("@examplechat", 42, "must not escape later") is False
+        await asyncio.sleep(0)
+        assert client.sent == []
+
+    asyncio.run(scenario())
+
+
+def test_telethon_cross_thread_timeout_cancels_pending_send(tmp_path):
+    class _SlowClient(_FakeTelethonClient):
+        async def send_message(self, entity, text, reply_to=None):
+            await asyncio.sleep(0.05)
+            self.sent.append((entity, text, reply_to))
+
+    client = _SlowClient()
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    try:
+        t = TelethonTransport(client=client, inbox=GroupInbox(tmp_path), loop=loop,
+                              send_timeout=0.01)
+        assert t.do_reply("@examplechat", 42, "cancel me") is False
+        time.sleep(0.08)
+        assert client.sent == []
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=1)
+        loop.close()
+
+
+def test_telethon_closed_loop_failure_closes_unscheduled_coroutine(tmp_path):
+    loop = asyncio.new_event_loop()
+    loop.close()
+    transport = TelethonTransport(client=_FakeTelethonClient(),
+                                  inbox=GroupInbox(tmp_path), loop=loop)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert transport.do_reply("@examplechat", 42, "closed") is False
+        gc.collect()
+    assert not any("never awaited" in str(item.message) for item in caught)
 
 
 def test_telethon_event_feeds_inbox(tmp_path, monkeypatch):

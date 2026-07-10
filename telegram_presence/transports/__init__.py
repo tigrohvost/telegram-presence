@@ -7,5 +7,6 @@ to a concrete Telegram client. Two are provided:
 
 Both expose the same surface: feed incoming group messages into a
 ``GroupInbox`` and provide ``do_reply(peer, msg_id, text)`` /
-``do_react(peer, msg_id, emoji)`` for ``run_telegram_engage_cycle``.
+``do_react(peer, msg_id, emoji)`` for ``run_telegram_engage_cycle``. They also
+provide ``send_envelope(envelope)`` for the durable outbox path.
 """

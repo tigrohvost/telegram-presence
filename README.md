@@ -9,7 +9,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+" />
   <img src="https://img.shields.io/badge/deps-stdlib%20only-brightgreen.svg" alt="stdlib only" />
-  <img src="https://img.shields.io/badge/tests-102-brightgreen.svg" alt="102 tests" />
+  <img src="https://img.shields.io/badge/tests-passing-brightgreen.svg" alt="tests passing" />
 </p>
 
 <p align="center"><b>A group-chat presence organ for LLM agents.</b><br/>
@@ -45,6 +45,17 @@ injected callables.
 - **decision log** — every decider batch is logged raw → policy trace →
   final actions (`state/telegram_engage_decisions.jsonl`), so
   under-delegation and dropped replies are measurable instead of anecdotal.
+- **durable, correlated delivery** — outbound intent is represented by a
+  transport-aware `MessageEnvelope` and tracked as a `DeliveryRecord`. The
+  stdlib-only outbox persists `pending → sending → acked`, records retryable
+  `failed` attempts, and moves exhausted deliveries to `dead_letter`. ACK is
+  written only after the transport reports success; interrupted `sending`
+  records are recovered after restart.
+- **safe transport boundaries** — optional owner-only private authorization
+  uses an immutable numeric Telegram user ID, the host can fail fast on an
+  invalid poller/scheduler cadence at startup, long text is split on semantic
+  boundaries, and media is rejected before sending when its MIME type or size
+  exceeds policy.
 - **addressed detection & spool** — a bounded jsonl inbox with name/mention
   matching (including Cyrillic inflections), reply-chain awareness, and a
   roster of participants that accumulates notes across days.
@@ -64,6 +75,11 @@ delegate.py — composer prompt for substantive answers (KB + memory + thread)
 thread.py   — conversation-thread reconstruction from spool + own replies
 roster.py   — participant notes that accumulate instead of overwrite
 hooks.py    — every host-specific touch point, injectable
+delivery.py — MessageEnvelope/DeliveryRecord and correlation contract
+outbox.py   — durable delivery states, bounded retries, restart recovery
+policy.py   — immutable numeric owner identity and private-chat policy
+liveness.py — scheduler/poller cadence validation
+content.py  — semantic text chunking and bounded media validation
 ```
 
 The engage cycle is pure dependency injection — you hand it callables:
@@ -117,7 +133,121 @@ client.add_event_handler(transport.on_group_message,
 Then hand `transport.do_reply` / `transport.do_react` to
 `run_telegram_engage_cycle`. Reactions over Telethon need a
 `react_request` factory (raw `SendReactionRequest`); over Bot API they use
-`setMessageReaction` out of the box.
+`setMessageReaction` out of the box. Those existing boolean APIs are
+preserved. `do_reply` now sends every semantic chunk in order and returns
+`True` only when all chunks succeed. A logical reply is limited to eight
+chunks by default (`max_text_chunks` changes the bound); an oversized reply is
+rejected before the first transport call.
+
+## Reliable delivery
+
+For a crash-safe outbound path, persist the intent before transport I/O and
+dispatch it through the adapter's `send_envelope` method:
+
+```python
+from telegram_presence import DurableOutbox, MessageEnvelope
+
+outbox = DurableOutbox(
+    "data/telegram-outbox",
+    max_attempts=5,
+    base_retry_seconds=2,
+    max_retry_seconds=120,
+)
+record = outbox.enqueue(MessageEnvelope(
+    transport="bot_api",                 # use "telethon" for that adapter
+    peer="@examplechat",
+    kind="reply",
+    text=answer,
+    reply_to_message_id=message_id,
+    correlation_id=cycle_id,
+    causation_id=f"telegram:{message_id}",
+    idempotency_key=f"reply:{chat_id}:{message_id}",
+))
+outbox.dispatch_due(transport.send_envelope)
+```
+
+`dispatch_due` performs one bounded pass; it does not start a background
+worker. Call it regularly from the host scheduler. Bound bundled adapter
+methods are filtered to their own transport automatically. For one shared
+outbox containing both transports, route explicitly:
+
+```python
+outbox.dispatch_due({
+    "bot_api": bot_transport.send_envelope,
+    "telethon": user_transport.send_envelope,
+})
+```
+
+The existing engage cycle intentionally keeps its simple boolean callback
+contract. Use the outbox for host-owned outbound workflows that also consume
+`DeliveryRecord` ACKs; delayed ACK reconciliation into engage action logs and
+caps is outside this package's current engage API.
+
+The durable states are `pending`, `sending`, `acked`, `failed`, and
+`dead_letter`. Failures back off exponentially up to the configured ceiling;
+attempt count is bounded. On startup, stale `sending` leases become retryable
+again. ACK never means merely queued or selected — it means the adapter
+reported transport success.
+Set `sending_timeout_seconds` above the longest legitimate transport call so
+a second worker does not recover a lease that is merely slow.
+
+The guarantee is **at least once**, not exactly once. A process can fail after
+Telegram accepted a message but before the local ACK reached disk. Keep the
+same `idempotency_key` when enqueueing after a restart, and carry
+`correlation_id` into your logs so a rare duplicate is diagnosable.
+For a multi-chunk reply, the whole envelope is the retry unit: if chunk N
+fails, a retry can repeat the already accepted prefix. The optional
+`transport_message_id` is available to custom senders; bundled compatibility
+adapters currently leave it unset.
+
+Every dispatch scans persisted records, including ACKed history. Apply a host
+retention policy with `purge_acked(before=...)`. Purging also removes local
+idempotency history, so reusing an old key after purge can send it again.
+Cross-process locking uses stdlib `fcntl` on Unix; on platforms without it,
+use only one process and one `DurableOutbox` instance per root.
+
+Media envelopes store only a validated `MediaDescriptor`, not binary data.
+The bundled adapters deliberately return a failed receipt for media because
+actual upload mechanics are host-specific; inject a sender that reads the
+descriptor only after its declared MIME and size have passed validation. The
+host sender must re-stat or inspect the actual source again immediately before
+upload; descriptor metadata is not proof of file contents.
+Default host limits are 10 MiB for JPEG/PNG/WebP/GIF images, 20 MiB for the
+allowed audio, MP4 video, PDF/JSON/ZIP types, and 1 MiB for plain text. Use
+`validate_media(..., allowed_mime_types=..., max_size_bytes=...)` to tighten
+them for a deployment.
+
+Telethon's compatibility methods are synchronous. Call `do_reply` and
+`send_envelope` outside the thread that owns a running asyncio loop; from an
+async Telethon handler, dispatch the outbox with `await asyncio.to_thread(...)`.
+The adapter rejects a same-loop sync call and cancels a cross-thread future on
+timeout. Remote acceptance racing with a timeout is still inherently
+ambiguous, which is one reason the outbox guarantee remains at-least-once.
+
+## Private-owner and liveness policies
+
+The private-chat helper is opt-in and authorizes only a fixed numeric user ID:
+
+```python
+from telegram_presence.liveness import validate_liveness_cadence
+from telegram_presence.policy import OwnerPrivateChatPolicy
+
+owner = OwnerPrivateChatPolicy(owner_user_id=123456789)
+if not owner.allows_private(sender_user_id, chat_type=chat_type):
+    return  # username and display name are never authorization identities
+
+cadence = validate_liveness_cadence(
+    poll_interval_seconds=30,
+    cycle_interval_seconds=300,
+    stale_after_seconds=360,
+)
+```
+
+This utility does not add a private route to the engage cycle and does not
+change `GroupInbox` or `allowed_chats()`: group presence remains governed by
+the existing single chat-resolution point. `owner_user_id` carried by a
+`MessageEnvelope` is correlation metadata only; it never authorizes a sender,
+so invoke `OwnerPrivateChatPolicy` separately at the inbound boundary.
 
 ## Use as an agent skill
 
@@ -136,7 +266,8 @@ answer people from a retired chat.
 ## Tests
 
 ```
-python -m pytest tests/ -q     # 102 tests, no network, no Telegram account
+python -m pytest tests/ -q    # no network, no Telegram account
+python -m pytest tests/test_outbox.py tests/test_transports.py -q
 ```
 
 ## License

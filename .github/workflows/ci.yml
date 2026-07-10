@@ -16,4 +16,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install pytest
+      - name: Build and install wheel smoke
+        run: |
+          python -m pip wheel . --no-deps -w /tmp/telegram-presence-wheel
+          python -m pip install --force-reinstall /tmp/telegram-presence-wheel/telegram_presence-*.whl
+          cd /tmp
+          python -c "import telegram_presence; from telegram_presence.transports.bot_api import BotApiTransport; assert telegram_presence.__version__ == '0.2.0'; assert BotApiTransport.transport_name == 'bot_api'"
       - run: python -m pytest tests/ -q
