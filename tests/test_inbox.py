@@ -1,6 +1,7 @@
 """Tests for the realtime group-mention inbox (no LLM, untrusted text)."""
 import json
 
+from telegram_presence import hooks
 from telegram_presence.inbox import (
     GroupInbox,
     chat_matches,
@@ -63,6 +64,149 @@ def test_inbox_dedups_by_message_id(tmp_path):
                              text="@rain_ouroboros hi", reply_to_msg_id=None, self_id=9) is True
     assert inbox.add_message(chat="@c", message_id=1, sender_id=7,
                              text="@rain_ouroboros hi", reply_to_msg_id=None, self_id=9) is False
+
+
+def test_inbox_marks_seen_only_after_durable_append(monkeypatch, tmp_path):
+    inbox = GroupInbox(tmp_path)
+    real_append = inbox._append
+
+    def fail_append(_row):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(inbox, "_append", fail_append)
+    values = {
+        "chat": "@c",
+        "message_id": 2,
+        "sender_id": 7,
+        "text": "@rain retry me",
+        "reply_to_msg_id": None,
+        "self_id": 9,
+    }
+    assert inbox.add_message(**values) is False
+    assert inbox.pending() == []
+
+    monkeypatch.setattr(inbox, "_append", real_append)
+    assert inbox.add_message(**values) is True
+    assert [row["message_id"] for row in inbox.pending()] == [2]
+
+
+def test_inbox_recovers_seen_ids_after_restart(tmp_path):
+    values = {
+        "chat": "@c",
+        "message_id": 3,
+        "sender_id": 7,
+        "text": "@rain only once",
+        "reply_to_msg_id": None,
+        "self_id": 9,
+    }
+    assert GroupInbox(tmp_path).add_message(**values) is True
+    assert GroupInbox(tmp_path).add_message(**values) is False
+    assert [row["message_id"] for row in GroupInbox(tmp_path).pending()] == [3]
+
+
+def test_inbox_repairs_torn_jsonl_tail_before_acknowledging(tmp_path):
+    spool = tmp_path / "state" / "telegram_group_inbox.jsonl"
+    spool.parent.mkdir(parents=True)
+    spool.write_bytes(b'{"chat":"@c"')
+
+    inbox = GroupInbox(tmp_path)
+    result = inbox.ingest_message(
+        chat="@c",
+        message_id=7,
+        sender_id=7,
+        text="@rain survives torn tail",
+        reply_to_msg_id=None,
+        self_id=9,
+    )
+
+    assert result.written is True and result.safe_to_ack is True
+    assert [row["message_id"] for row in inbox.pending()] == [7]
+    assert [json.loads(line)["message_id"] for line in spool.read_text().splitlines()] == [7]
+
+
+def test_inbox_rechecks_disk_under_cross_instance_lock(tmp_path):
+    first = GroupInbox(tmp_path)
+    second = GroupInbox(tmp_path)
+    values = {
+        "chat": "@c",
+        "message_id": 8,
+        "sender_id": 7,
+        "text": "@rain cross instance",
+        "reply_to_msg_id": None,
+        "self_id": 9,
+    }
+
+    assert first.add_message(**values) is True
+    assert second.add_message(**values) is False
+    assert [row["message_id"] for row in second.pending()] == [8]
+
+
+def test_inbox_reconfirms_on_disk_row_after_directory_fsync_failure(
+    monkeypatch, tmp_path
+):
+    (tmp_path / "state").mkdir()
+    inbox = GroupInbox(tmp_path)
+    real_fsync_directory = inbox._fsync_directory
+    monkeypatch.setattr(
+        inbox,
+        "_fsync_directory",
+        lambda _path: (_ for _ in ()).throw(OSError("directory fsync failed")),
+    )
+    values = {
+        "chat": "@c",
+        "message_id": 9,
+        "sender_id": 7,
+        "text": "@rain fsync retry",
+        "reply_to_msg_id": None,
+        "self_id": 9,
+    }
+
+    failed = inbox.ingest_message(**values)
+    assert failed.safe_to_ack is False
+    monkeypatch.setattr(inbox, "_fsync_directory", real_fsync_directory)
+    duplicate = inbox.ingest_message(**values)
+
+    assert duplicate.written is False and duplicate.safe_to_ack is True
+    assert [row["message_id"] for row in inbox.pending()] == [9]
+
+
+def test_inbox_redacts_secret_before_jsonl_write(monkeypatch, tmp_path):
+    monkeypatch.setattr(hooks, "_redactor", hooks._default_redact)
+    inbox = GroupInbox(tmp_path)
+    assert inbox.add_message(
+        chat="@c",
+        message_id=4,
+        sender_id=7,
+        sender_username="ghp_ABCDEFGHIJ",
+        text="@rain token=SUPERSECRET123",
+        reply_to_msg_id=None,
+        self_id=9,
+    ) is True
+
+    raw = (tmp_path / "state" / "telegram_group_inbox.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "SUPERSECRET123" not in raw
+    assert "ghp_ABCDEFGHIJ" not in raw
+    assert "«redacted»" in raw
+    assert (tmp_path / "state").stat().st_mode & 0o777 == 0o700
+    assert (tmp_path / "state" / "telegram_group_inbox.jsonl").stat().st_mode & 0o777 == 0o600
+
+
+def test_inbox_preserves_existing_shared_state_directory_mode(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o750)
+    state.chmod(0o750)
+
+    assert GroupInbox(tmp_path).add_message(
+        chat="@c",
+        message_id=10,
+        sender_id=7,
+        text="@rain shared state",
+        reply_to_msg_id=None,
+        self_id=9,
+    ) is True
+    assert state.stat().st_mode & 0o777 == 0o750
 
 
 def test_inbox_refreshes_receipt_on_addressed(tmp_path):

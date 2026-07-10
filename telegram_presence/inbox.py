@@ -7,16 +7,24 @@ backfill/diagnostic tool).
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import datetime
+from dataclasses import dataclass
 import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Optional
+
+try:  # pragma: no cover - Unix path is exercised; fallback is single-process
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +38,20 @@ MAX_OWN_IDS = 200
 DEFAULT_NAMES = ("rain", "rain_ouroboros", "рейн", "рэйн", "ouroboros", "ороборос")
 INFLECTED_ROOTS = ("рейн", "рэйн", "ороборос")
 _CYR = "а-яёА-ЯЁ"
+
+
+@dataclass(frozen=True, slots=True)
+class InboxAddResult:
+    """Outcome of one inbox write attempt.
+
+    ``safe_to_ack`` means an upstream transport may advance its cursor: the
+    row was durably written, was already present, or was intentionally ignored.
+    A storage failure is the only outcome that must leave the cursor in place.
+    """
+
+    written: bool
+    safe_to_ack: bool
+    reason: str
 
 
 def _compile_term_patterns(term: str) -> list[tuple[str, re.Pattern[str]]]:
@@ -159,10 +181,12 @@ class GroupInbox:
         self._root = Path(drive_root)
         self._spool = self._root / SPOOL_REL
         self._receipt = self._root / RECEIPT_REL
+        self._storage_lock_path = self._spool.parent / ".telegram_group_inbox.lock"
         self._lock = threading.Lock()
         self._seen: set[tuple[str, int]] = set()
         self._seen_order: deque[tuple[str, int]] = deque(maxlen=MAX_SEEN_IDS)
         self._own_ids: deque[int] = deque(maxlen=MAX_OWN_IDS)
+        self._load_seen_from_spool()
 
     def remember_own_message(self, message_id: int) -> None:
         with self._lock:
@@ -173,44 +197,73 @@ class GroupInbox:
                     sender_username: Optional[str] = None, sender_name: Optional[str] = None,
                     now: Optional[float] = None) -> bool:
         """Spool one group message. Returns True when a row was written."""
+        return self.ingest_message(
+            chat=chat,
+            message_id=message_id,
+            sender_id=sender_id,
+            text=text,
+            reply_to_msg_id=reply_to_msg_id,
+            self_id=self_id,
+            sender_username=sender_username,
+            sender_name=sender_name,
+            now=now,
+        ).written
+
+    def ingest_message(self, *, chat: str, message_id: int, sender_id: Optional[int],
+                       text: str, reply_to_msg_id: Optional[int], self_id: Optional[int],
+                       sender_username: Optional[str] = None,
+                       sender_name: Optional[str] = None,
+                       now: Optional[float] = None) -> InboxAddResult:
+        """Spool one message and expose whether a transport may ACK it.
+
+        The seen-id cache is updated only after the jsonl row has been flushed
+        and fsynced. This preserves the boolean ``add_message`` API while
+        letting cursor-based transports distinguish duplicates from failures.
+        """
         try:
             mid = int(message_id)
         except (TypeError, ValueError):
-            return False
+            return InboxAddResult(False, True, "invalid_message_id")
         if self_id is not None and sender_id == self_id:
             self.remember_own_message(mid)
-            return False
+            return InboxAddResult(False, True, "own_message")
         key = (str(chat), mid)
+        terms = matched_terms(text)
+        from .hooks import redact
+        redacted_text = redact(text)
+        redacted_sender_username = redact(sender_username or "")
+        redacted_sender_name = redact(sender_name or "")
+        persisted_terms = [sanitize_snippet(redact(term), 64) for term in terms]
+
         with self._lock:
             if key in self._seen:
-                return False
-            if len(self._seen_order) == self._seen_order.maxlen and self._seen_order:
-                self._seen.discard(self._seen_order[0])
-            self._seen_order.append(key)
-            self._seen.add(key)
+                return InboxAddResult(False, True, "duplicate")
             own_ids = set(self._own_ids)
-
-        terms = matched_terms(text)
-        reply_to_me = reply_to_msg_id is not None and int(reply_to_msg_id) in own_ids
-        addressed = bool(terms) or reply_to_me
-        row = {
-            "ts": time.time() if now is None else float(now),
-            "chat": str(chat),
-            "message_id": mid,
-            "sender_id": sender_id,
-            "sender_username": clean_handle(sender_username),
-            "sender_name": (sanitize_snippet(sender_name, 64) or None),
-            "reply_to_msg_id": (int(reply_to_msg_id) if reply_to_msg_id is not None else None),
-            "addressed": addressed,
-            "matched_terms": terms + (["reply_to_me"] if reply_to_me else []),
-            "snippet": sanitize_snippet(text),
-            "untrusted_external_text": True,
-        }
-        try:
-            self._append(row)
-        except Exception:
-            log.warning("telegram_group_inbox: spool append failed", exc_info=True)
-            return False
+            reply_to_me = reply_to_msg_id is not None and int(reply_to_msg_id) in own_ids
+            addressed = bool(terms) or reply_to_me
+            row = {
+                "ts": time.time() if now is None else float(now),
+                "chat": str(chat),
+                "message_id": mid,
+                "sender_id": sender_id,
+                "sender_username": clean_handle(redacted_sender_username),
+                "sender_name": (sanitize_snippet(redacted_sender_name, 64) or None),
+                "reply_to_msg_id": (
+                    int(reply_to_msg_id) if reply_to_msg_id is not None else None
+                ),
+                "addressed": addressed,
+                "matched_terms": persisted_terms + (["reply_to_me"] if reply_to_me else []),
+                "snippet": sanitize_snippet(redacted_text),
+                "untrusted_external_text": True,
+            }
+            try:
+                appended = self._append(row)
+            except Exception:
+                log.warning("telegram_group_inbox: spool append failed", exc_info=True)
+                return InboxAddResult(False, False, "storage_failure")
+            self._remember_seen_unlocked(key)
+            if not appended:
+                return InboxAddResult(False, True, "duplicate")
         if addressed:
             self._refresh_receipt(str(chat))
         try:
@@ -220,7 +273,7 @@ class GroupInbox:
                             now=row["ts"])
         except Exception:
             log.debug("telegram_group_inbox: roster observe failed", exc_info=True)
-        return True
+        return InboxAddResult(True, True, "written")
 
     def pending(self, after_ts: float = 0.0, limit: int = 50) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -245,16 +298,178 @@ class GroupInbox:
 
     # -- internals --
 
-    def _append(self, row: dict[str, Any]) -> None:
-        self._spool.parent.mkdir(parents=True, exist_ok=True)
+    def _remember_seen_unlocked(self, key: tuple[str, int]) -> None:
+        if key in self._seen:
+            return
+        if len(self._seen_order) == self._seen_order.maxlen and self._seen_order:
+            self._seen.discard(self._seen_order[0])
+        self._seen_order.append(key)
+        self._seen.add(key)
+
+    def _load_seen_from_spool(self) -> None:
+        """Hydrate recent durable ids so a replay after restart is a no-op."""
         try:
-            if self._spool.stat().st_size > MAX_SPOOL_BYTES:
-                keep = self._spool.read_text(encoding="utf-8").splitlines()[-500:]
-                self._spool.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            with self._spool.open("r", encoding="utf-8") as source:
+                lines = deque(source, maxlen=MAX_SEEN_IDS)
         except FileNotFoundError:
-            pass
-        with self._spool.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            return
+        except Exception:
+            log.warning("telegram_group_inbox: seen-id recovery failed", exc_info=True)
+            return
+        for line in lines:
+            try:
+                row = json.loads(line)
+                key = (str(row["chat"]), int(row["message_id"]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            self._remember_seen_unlocked(key)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        if os.name != "posix":  # directory fsync is not portable
+            return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(path, flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _ensure_state_directory(self) -> None:
+        directory = self._spool.parent
+        created = not directory.exists()
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if created:
+            self._fsync_directory(directory.parent)
+
+    @contextmanager
+    def _storage_locked(self):
+        self._ensure_state_directory()
+        descriptor = os.open(
+            self._storage_lock_path,
+            os.O_CREAT | os.O_RDWR,
+            0o600,
+        )
+        try:
+            try:
+                os.fchmod(descriptor, 0o600)
+            except OSError:
+                pass
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def _repair_torn_tail_locked(self) -> None:
+        """Drop an incomplete final jsonl row before appending another one."""
+        try:
+            with self._spool.open("r+b") as spool:
+                payload = spool.read()
+                if not payload or payload.endswith(b"\n"):
+                    return
+                row_start = payload.rfind(b"\n") + 1
+                tail = payload[row_start:]
+                complete = False
+                try:
+                    row = json.loads(tail.decode("utf-8"))
+                    complete = isinstance(row, dict)
+                    str(row["chat"])
+                    int(row["message_id"])
+                except (KeyError, TypeError, ValueError, UnicodeDecodeError,
+                        json.JSONDecodeError):
+                    complete = False
+                spool.seek(0, os.SEEK_END)
+                if complete:
+                    spool.write(b"\n")
+                else:
+                    spool.truncate(row_start)
+                spool.flush()
+                os.fsync(spool.fileno())
+        except FileNotFoundError:
+            return
+
+    def _spool_contains_key_locked(self, key: tuple[str, int]) -> bool:
+        try:
+            with self._spool.open("r", encoding="utf-8") as source:
+                for line in source:
+                    try:
+                        row = json.loads(line)
+                        candidate = (str(row["chat"]), int(row["message_id"]))
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if candidate == key:
+                        return True
+        except FileNotFoundError:
+            return False
+        return False
+
+    def _rotate_locked(self) -> None:
+        try:
+            if self._spool.stat().st_size <= MAX_SPOOL_BYTES:
+                return
+        except FileNotFoundError:
+            return
+        keep = self._spool.read_text(encoding="utf-8").splitlines()[-500:]
+        payload = (("\n".join(keep) + "\n") if keep else "").encode("utf-8")
+        temporary_name: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=self._spool.parent,
+                prefix=".telegram-inbox-",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_name = temporary.name
+                os.chmod(temporary_name, 0o600)
+                temporary.write(payload)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, self._spool)
+            temporary_name = None
+            self._fsync_directory(self._spool.parent)
+        finally:
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name)
+                except FileNotFoundError:
+                    pass
+
+    def _append(self, row: dict[str, Any]) -> bool:
+        """Append one private durable row; return False for an on-disk duplicate."""
+        key = (str(row["chat"]), int(row["message_id"]))
+        encoded = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+        with self._storage_locked():
+            self._repair_torn_tail_locked()
+            if self._spool_contains_key_locked(key):
+                # Confirm the directory entry before allowing a replayed update
+                # to advance the upstream cursor.
+                self._fsync_directory(self._spool.parent)
+                return False
+            self._rotate_locked()
+            descriptor = os.open(
+                self._spool,
+                os.O_CREAT | os.O_APPEND | os.O_WRONLY,
+                0o600,
+            )
+            try:
+                try:
+                    os.fchmod(descriptor, 0o600)
+                except OSError:
+                    pass
+                with os.fdopen(descriptor, "wb", closefd=False) as spool:
+                    spool.write(encoded)
+                    spool.flush()
+                    os.fsync(spool.fileno())
+            finally:
+                os.close(descriptor)
+            self._fsync_directory(self._spool.parent)
+            return True
 
     def _refresh_receipt(self, chat: str) -> None:
         """Keep the legacy monitor receipt alive for dashboards/contracts."""

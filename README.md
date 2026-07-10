@@ -56,9 +56,10 @@ injected callables.
   invalid poller/scheduler cadence at startup, long text is split on semantic
   boundaries, and media is rejected before sending when its MIME type or size
   exceeds policy.
-- **addressed detection & spool** — a bounded jsonl inbox with name/mention
-  matching (including Cyrillic inflections), reply-chain awareness, and a
-  roster of participants that accumulates notes across days.
+- **addressed detection & spool** — a bounded, fsynced jsonl inbox with
+  name/mention matching (including Cyrillic inflections), reply-chain
+  awareness, restart-safe recent-id deduplication, and a roster of participants
+  that accumulates notes across days.
 - **untrusted by construction** — chat text is treated as untrusted input:
   snippets are sanitized and length-capped, secret-like tokens are redacted
   before anything reaches disk, and composer prompts carry an explicit
@@ -138,6 +139,23 @@ preserved. `do_reply` now sends every semantic chunk in order and returns
 `True` only when all chunks succeed. A logical reply is limited to eight
 chunks by default (`max_text_chunks` changes the bound); an oversized reply is
 rejected before the first transport call.
+
+`BotApiTransport.poll_updates()` advances its in-memory Telegram offset only
+after `GroupInbox` has fsynced the row, recognized a durable duplicate, or
+intentionally ignored the update. A storage failure stops that polling batch
+without advancing past the failed update. Recent message IDs are reloaded from
+the spool after restart, so Telegram replay does not append the same row again.
+The offset itself is not persisted, and this lightweight spool is not Rain's
+full durable task-ingress queue. The Telethon handler also waits for the spool
+write and returns `False` on failure, but event replay remains the host/client's
+responsibility.
+
+`GroupInbox.ingest_message()` returns an `InboxAddResult` for transports that
+need to distinguish `written`/durable duplicate from storage failure; the
+original boolean `add_message()` API remains compatible. Custom inbox classes
+that override `add_message()` keep the legacy cursor behavior unless they also
+implement `ingest_message()`. Unix hosts serialize multiple inbox instances
+with `fcntl`; without it, use one writer process and one inbox instance.
 
 ## Reliable delivery
 

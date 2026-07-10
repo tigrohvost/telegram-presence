@@ -81,37 +81,113 @@ class BotApiTransport:
     def poll_updates(self, limit: int = 50) -> int:
         """One getUpdates pass; spool allowed-chat group messages. Returns
         the number of rows written."""
-        from telegram_presence.inbox import allowed_chats, chat_matches_any
+        from telegram_presence.inbox import GroupInbox, allowed_chats, chat_matches_any
         body = self._call("getUpdates", {"offset": self._offset, "limit": limit,
                                          "timeout": 0,
                                          "allowed_updates": ["message"]})
         written = 0
         for upd in body.get("result") or []:
             try:
-                self._offset = max(self._offset, int(upd.get("update_id", 0)) + 1)
-            except (TypeError, ValueError):
+                next_offset = int(upd["update_id"]) + 1
+            except (KeyError, TypeError, ValueError):
                 continue
-            msg = upd.get("message") or {}
-            chat = msg.get("chat") or {}
+            raw_message = upd.get("message")
+            if raw_message is None:
+                self._offset = max(self._offset, next_offset)
+                continue
+            if not isinstance(raw_message, dict):
+                log.warning("bot_api ignored malformed message update")
+                self._offset = max(self._offset, next_offset)
+                continue
+            msg = raw_message
+            chat = msg.get("chat")
+            if not isinstance(chat, dict):
+                log.warning("bot_api ignored malformed message update")
+                self._offset = max(self._offset, next_offset)
+                continue
             if chat.get("type") not in ("group", "supergroup"):
+                self._offset = max(self._offset, next_offset)
                 continue
             allowed = chat_matches_any(chat.get("username"), chat.get("id"),
                                        allowed_chats())
             if allowed is None:
+                self._offset = max(self._offset, next_offset)
                 continue
-            frm = msg.get("from") or {}
-            reply_to = (msg.get("reply_to_message") or {}).get("message_id")
-            ok = self._inbox.add_message(
-                chat=allowed,
-                message_id=msg.get("message_id") or 0,
-                sender_id=frm.get("id"),
-                sender_username=frm.get("username"),
-                sender_name=" ".join(x for x in (frm.get("first_name"),
-                                                 frm.get("last_name")) if x) or None,
-                text=msg.get("text") or msg.get("caption") or "",
-                reply_to_msg_id=reply_to,
-                self_id=self._self_id,
-            )
+            try:
+                message_id = msg["message_id"]
+                if (isinstance(message_id, bool) or not isinstance(message_id, int)
+                        or message_id < 1):
+                    raise ValueError("invalid message_id")
+                frm = msg.get("from") or {}
+                if not isinstance(frm, dict):
+                    raise ValueError("invalid sender")
+                reply_message = msg.get("reply_to_message") or {}
+                if not isinstance(reply_message, dict):
+                    raise ValueError("invalid reply target")
+                reply_to = reply_message.get("message_id")
+                if (reply_to is not None
+                        and (isinstance(reply_to, bool)
+                             or not isinstance(reply_to, int) or reply_to < 1)):
+                    raise ValueError("invalid reply target")
+                text = msg.get("text")
+                if text is None:
+                    text = msg.get("caption")
+                if text is None:
+                    text = ""
+                if not isinstance(text, str):
+                    raise ValueError("invalid message text")
+            except (KeyError, TypeError, ValueError):
+                log.warning("bot_api ignored malformed message update")
+                self._offset = max(self._offset, next_offset)
+                continue
+            names = [
+                item for item in (frm.get("first_name"), frm.get("last_name"))
+                if isinstance(item, str) and item
+            ]
+            values = {
+                "chat": allowed,
+                "message_id": message_id,
+                "sender_id": frm.get("id"),
+                "sender_username": frm.get("username"),
+                "sender_name": " ".join(names) or None,
+                "text": text,
+                "reply_to_msg_id": reply_to,
+                "self_id": self._self_id,
+            }
+            try:
+                ingest = getattr(self._inbox, "ingest_message", None)
+                inbox_type = type(self._inbox)
+                add_override = getattr(inbox_type, "add_message", None)
+                instance_values = getattr(self._inbox, "__dict__", {})
+                ingest_override = (
+                    getattr(inbox_type, "ingest_message", None)
+                    is not GroupInbox.ingest_message
+                )
+                use_ingest = callable(ingest) and (
+                    not isinstance(self._inbox, GroupInbox)
+                    or ingest_override
+                    or "ingest_message" in instance_values
+                    or (add_override is GroupInbox.add_message
+                        and "add_message" not in instance_values)
+                )
+                if use_ingest:
+                    result = ingest(**values)
+                    ok = bool(result.written)
+                    safe_to_ack = bool(result.safe_to_ack)
+                else:
+                    ok = bool(self._inbox.add_message(**values))
+                    # The legacy boolean inbox API cannot distinguish a
+                    # duplicate/intentional ignore from a write failure. Keep
+                    # its historical cursor semantics; durable fail-closed
+                    # ordering requires GroupInbox.ingest_message().
+                    safe_to_ack = True
+            except Exception as exc:
+                log.warning("bot_api inbox persistence failed: %s", type(exc).__name__)
+                break
+            if not safe_to_ack:
+                log.warning("bot_api inbox persistence failed; retaining update offset")
+                break
+            self._offset = max(self._offset, next_offset)
             written += 1 if ok else 0
         return written
 

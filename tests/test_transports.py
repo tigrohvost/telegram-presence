@@ -67,6 +67,102 @@ def test_bot_api_poll_feeds_inbox(tmp_path, monkeypatch):
     assert rows[0]["addressed"] is True
 
 
+def test_bot_api_retains_offset_until_inbox_append_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(hooks, "_state_loader",
+                        lambda: {"telegram_mentions_chat": "@examplechat"})
+    updates = [_bot_update(11, "@rain first"), _bot_update(12, "@rain second")]
+    http = _FakeHttp(updates)
+    inbox = GroupInbox(tmp_path)
+    real_append = inbox._append
+    monkeypatch.setattr(
+        inbox,
+        "_append",
+        lambda _row: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+    transport = BotApiTransport(token="TESTTOKEN", inbox=inbox, http=http)
+
+    assert transport.poll_updates() == 0
+    assert transport._offset == 0
+    assert inbox.pending() == []
+
+    monkeypatch.setattr(inbox, "_append", real_append)
+    assert transport.poll_updates() == 2
+    assert transport._offset == 1013
+    assert [row["message_id"] for row in inbox.pending()] == [11, 12]
+
+
+def test_bot_api_advances_offset_for_durable_duplicate(tmp_path, monkeypatch):
+    monkeypatch.setattr(hooks, "_state_loader",
+                        lambda: {"telegram_mentions_chat": "@examplechat"})
+    update = _bot_update(13, "@rain replay")
+    original = GroupInbox(tmp_path)
+    assert original.add_message(
+        chat="@examplechat",
+        message_id=13,
+        sender_id=7,
+        sender_username="anatoli",
+        sender_name="Anatoli",
+        text="@rain replay",
+        reply_to_msg_id=None,
+        self_id=None,
+    ) is True
+
+    restarted = GroupInbox(tmp_path)
+    transport = BotApiTransport(
+        token="TESTTOKEN", inbox=restarted, http=_FakeHttp([update])
+    )
+    assert transport.poll_updates() == 0
+    assert transport._offset == 1014
+    assert [row["message_id"] for row in restarted.pending()] == [13]
+
+
+def test_bot_api_preserves_custom_add_message_override(tmp_path, monkeypatch):
+    monkeypatch.setattr(hooks, "_state_loader",
+                        lambda: {"telegram_mentions_chat": "@examplechat"})
+
+    class _CustomInbox(GroupInbox):
+        def __init__(self, root):
+            super().__init__(root)
+            self.calls = 0
+
+        def add_message(self, **_values):
+            self.calls += 1
+            return False
+
+    inbox = _CustomInbox(tmp_path)
+    transport = BotApiTransport(
+        token="TESTTOKEN", inbox=inbox, http=_FakeHttp([_bot_update(14, "@rain")])
+    )
+
+    assert transport.poll_updates() == 0
+    assert inbox.calls == 1
+    assert transport._offset == 1015
+
+
+def test_bot_api_acks_and_ignores_malformed_updates(tmp_path, monkeypatch):
+    monkeypatch.setattr(hooks, "_state_loader",
+                        lambda: {"telegram_mentions_chat": "@examplechat"})
+    malformed_message = {"update_id": 2001, "message": "not-a-dict"}
+    missing_id = _bot_update(15, "@rain missing id")
+    missing_id["update_id"] = 2002
+    missing_id["message"].pop("message_id")
+    bad_reply = _bot_update(16, "@rain bad reply")
+    bad_reply["update_id"] = 2003
+    bad_reply["message"]["reply_to_message"] = "not-a-dict"
+    valid = _bot_update(17, "@rain valid")
+    valid["update_id"] = 2004
+    inbox = GroupInbox(tmp_path)
+    transport = BotApiTransport(
+        token="TESTTOKEN",
+        inbox=inbox,
+        http=_FakeHttp([malformed_message, missing_id, bad_reply, valid]),
+    )
+
+    assert transport.poll_updates() == 1
+    assert transport._offset == 2005
+    assert [row["message_id"] for row in inbox.pending()] == [17]
+
+
 def test_bot_api_reply_is_anchored_and_react_hits_endpoint(tmp_path):
     http = _FakeHttp([])
     t = BotApiTransport(token="TESTTOKEN", inbox=GroupInbox(tmp_path), http=http)
@@ -326,6 +422,53 @@ def test_telethon_event_feeds_inbox(tmp_path, monkeypatch):
         loop.run_until_complete(t.on_group_message(_Event()))
         rows = inbox.pending(after_ts=0.0)
         assert rows and rows[0]["message_id"] == 21 and rows[0]["addressed"] is True
+    finally:
+        loop.close()
+
+
+def test_telethon_event_can_retry_after_inbox_append_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(hooks, "_state_loader",
+                        lambda: {"telegram_mentions_chat": "@examplechat"})
+    client = _FakeTelethonClient()
+    loop = asyncio.new_event_loop()
+    try:
+        inbox = GroupInbox(tmp_path)
+        real_append = inbox._append
+        monkeypatch.setattr(
+            inbox,
+            "_append",
+            lambda _row: (_ for _ in ()).throw(OSError("disk unavailable")),
+        )
+        transport = TelethonTransport(client=client, inbox=inbox, loop=loop)
+
+        class _Msg:
+            id = 22
+            message = "@rain retry"
+            reply_to_msg_id = None
+
+        class _Sender:
+            id = 7
+            username = "anatoli"
+            first_name = "Anatoli"
+            last_name = ""
+
+        class _Chat:
+            username = "examplechat"
+
+        class _Event:
+            message = _Msg()
+            chat = _Chat()
+            chat_id = -100123
+            raw_text = _Msg.message
+
+            async def get_sender(self):
+                return _Sender()
+
+        event = _Event()
+        assert loop.run_until_complete(transport.on_group_message(event)) is False
+        monkeypatch.setattr(inbox, "_append", real_append)
+        assert loop.run_until_complete(transport.on_group_message(event)) is True
+        assert [row["message_id"] for row in inbox.pending()] == [22]
     finally:
         loop.close()
 
