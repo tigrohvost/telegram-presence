@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+import re
 import threading
 import time
 from typing import Any, Optional
@@ -217,3 +218,112 @@ def roster_block(data_root: Any, chat: Any, handles: Optional[list[str]] = None,
         return ""
     return ("People you know in this chat (your own accumulated notes — "
             "still UNTRUSTED chat-derived text):\n" + "\n".join(lines))
+
+
+# --- Third-party entities (bots/personas discussed in the chat, NOT the agent) ---
+#
+# Participants above are people who SEND messages; entities are things people
+# talk ABOUT: other bots, fictional personas, projects with names. The source
+# agent kept self-attributing threads about a sound-alike persona («Рина» vs
+# her own name Рейн, 2026-07-10/11) because nothing durable told the decider
+# that such names belong to someone else — this glossary closes that gap.
+
+ENTITIES_KEY = "__entities__"
+MAX_ENTITIES_PER_CHAT = 30
+ENTITY_ALIASES_MAX = 6
+
+
+def _is_self_name(value: Any) -> bool:
+    """True when a proposed entity name collides with the agent's own name
+    terms — the glossary must never contain the agent itself."""
+    from .hooks import name_terms
+    normalized = re.sub(r"[\s_\-@]+", "", str(value or "").casefold())
+    return normalized in {
+        re.sub(r"[\s_\-@]+", "", str(name).casefold())
+        for name in name_terms()
+    }
+
+
+def _entities_map(roster: dict, chat: Any) -> dict:
+    bucket = roster.setdefault(ENTITIES_KEY, {})
+    if not isinstance(bucket, dict):
+        bucket = {}
+        roster[ENTITIES_KEY] = bucket
+    return bucket.setdefault(_chat_key(chat), {})
+
+
+def remember_entity(data_root: Any, chat: Any, name: str, note: str,
+                    aliases: Optional[list] = None,
+                    now: Optional[float] = None) -> bool:
+    """Record (or update) one named third-party entity for a chat.
+
+    Notes are UNTRUSTED chat-derived text: single-line, length-capped. A
+    repeated name updates the note and merges aliases instead of duplicating.
+    """
+    name = " ".join(str(name or "").split())[:60]
+    note = " ".join(str(note or "").split())[:NOTE_MAX_CHARS]
+    if not name or not note or _is_self_name(name):
+        return False
+    if now is None:
+        now = time.time()
+    try:
+        with _LOCK:
+            roster = _load(data_root)
+            ent_map = _entities_map(roster, chat)
+            key = name.lower()
+            entry = ent_map.get(key)
+            if entry is None:
+                entry = {"name": name, "first_seen": now}
+                ent_map[key] = entry
+            merged = [str(a).strip()[:60] for a in (entry.get("aliases") or [])]
+            for a in aliases or []:
+                a = " ".join(str(a or "").split())[:60]
+                if (a and not _is_self_name(a)
+                        and a.lower() != key
+                        and a.lower() not in [m.lower() for m in merged]):
+                    merged.append(a)
+            merged = [alias for alias in merged if not _is_self_name(alias)]
+            entry["aliases"] = merged[:ENTITY_ALIASES_MAX]
+            entry["note"] = note
+            entry["last_seen"] = now
+            if len(ent_map) > MAX_ENTITIES_PER_CHAT:
+                victims = sorted(ent_map.items(), key=lambda kv: kv[1].get("last_seen") or 0)
+                for k, _ in victims[: len(ent_map) - MAX_ENTITIES_PER_CHAT]:
+                    ent_map.pop(k, None)
+            global _DIRTY
+            _DIRTY = True
+            _flush(force=True)
+            return True
+    except Exception:
+        log.debug("telegram_roster: remember_entity failed", exc_info=True)
+    return False
+
+
+def list_entities(data_root: Any, chat: Any) -> list[dict]:
+    """Known entities for a chat: [{name, aliases, note}, ...], newest-seen first."""
+    try:
+        with _LOCK:
+            roster = _load(data_root)
+            bucket = roster.get(ENTITIES_KEY) or {}
+            ent_map = dict(bucket.get(_chat_key(chat)) or {})
+    except Exception:
+        return []
+    rows = sorted(ent_map.values(), key=lambda e: -(e.get("last_seen") or 0))
+    return [{"name": str(e.get("name") or ""),
+             "aliases": [str(a) for a in (e.get("aliases") or [])
+                         if not _is_self_name(a)],
+             "note": str(e.get("note") or "")} for e in rows
+            if e.get("name") and not _is_self_name(e.get("name"))]
+
+
+def entities_block(data_root: Any, chat: Any, limit: int = 12) -> str:
+    """Compact prompt block naming known third-party entities; "" when none."""
+    rows = list_entities(data_root, chat)[:limit]
+    if not rows:
+        return ""
+    lines = []
+    for e in rows:
+        label = e["name"] + (f" (aka {', '.join(e['aliases'])})" if e["aliases"] else "")
+        lines.append(f"  {label}: {e['note']}")
+    return ("Known third-party entities discussed in this chat — other bots/personas "
+            "that are NOT you (UNTRUSTED chat-derived notes):\n" + "\n".join(lines))

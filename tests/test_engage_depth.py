@@ -8,6 +8,20 @@ import json
 from telegram_presence import engage as te
 
 
+def _assessment(message_id, action="ignore", **fields):
+    row = {
+        "message_id": message_id, "addressed_to": "self",
+        "addressed_to_entity": "", "self_is_addressee": "yes",
+        "self_is_referent": "yes",
+        "address_confidence": 0.9, "context_sufficient": 0.9,
+        "referent": "Rain", "inner_thought": "test thought",
+        "motivation": "test motivation",
+        "want": "no" if action == "ignore" else "yes", "action": action,
+    }
+    row.update(fields)
+    return row
+
+
 def _cand(mid, snippet, *, addressed=True, kind="mention", sender=7, ts=100.0):
     return te.Candidate(mid, addressed, snippet, sender_id=sender,
                         sender_username=f"u{sender}", addressed_kind=kind, ts=ts)
@@ -63,12 +77,12 @@ def test_short_banter_stays_light_reply():
     assert out[0].action == "reply" and trace == []
 
 
-def test_unaddressed_reply_never_converts_to_delegate():
+def test_self_selected_deep_reply_can_use_delegate():
     q = "очень длинный вопрос в общий эфир? " * 10
     plans = [te.ActionPlan(1, "reply", text="t", depth="deep")]
     out, _ = te.apply_depth_policy(plans, cand_by_id={1: _cand(1, q, addressed=False, kind="none")},
                                    addressed_ids=set())
-    assert out[0].action == "reply"
+    assert out[0].action == "delegate"
 
 
 # --- validate: delegate over cap downgrades instead of dropping ---
@@ -87,6 +101,17 @@ def test_validate_keeps_delegate_fallback_text():
     out = te.validate_actions([te.ActionPlan(1, "delegate", text="draft", reason="q")],
                               addressed_ids={1})
     assert out[0].action == "delegate" and out[0].text == "draft"
+
+
+def test_side_participant_may_choose_deep_composer():
+    plan = te.ActionPlan(
+        9, "delegate", reason="важная новая деталь",
+        addressed_to="other", addressed_to_entity="@alice",
+        want="yes", depth="deep",
+    )
+    out = te.validate_actions([plan], addressed_ids=set())
+    assert out[0].action == "delegate"
+    assert out[0].addressed_to == "other"
 
 
 # --- resolve: composer failure falls back to the light draft ---
@@ -139,7 +164,9 @@ def test_cycle_writes_decision_log(tmp_path):
     packet = {"status": "ok",
               "matches": [{"message_id": 1, "snippet": "@rain hi", "sender_id": 7}],
               "recent": []}
-    decider = lambda prompt: '[{"message_id":1,"action":"reply","text":"из вежливости","want":"no"}]'
+    decider = lambda prompt: json.dumps([
+        _assessment(1, "ignore", want="no", reason="не хочу отвечать")
+    ])
     replies = []
     res = te.run_telegram_engage_cycle(
         drive_root=tmp_path,
@@ -154,4 +181,5 @@ def test_cycle_writes_decision_log(tmp_path):
     assert path.exists()
     row = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
     assert row["raw"][0]["want"] == "no"
-    assert any(t.get("why") == "want_no" for t in row.get("trace", []))
+    assert row["raw"][0]["action"] == "ignore"
+    assert row["final"] == []

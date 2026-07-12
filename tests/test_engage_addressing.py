@@ -43,6 +43,8 @@ def test_reply_target_resolved_from_packet():
          "reply_to_msg_id": 50, "matched_terms": []}]}
     by = {c.message_id: c for c in te.candidates_from_packet(pkt)}
     assert by[51].reply_to_username == "alice"
+    assert by[51].reply_to_message_id == 50
+    assert '"reply_to_message_id": 50' in te.build_decider_prompt([by[51]])
 
 
 def test_reply_to_me_flag():

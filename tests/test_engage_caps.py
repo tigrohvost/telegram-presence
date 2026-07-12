@@ -16,10 +16,10 @@ def test_defaults_without_override():
 
 
 def test_override_by_handle_with_and_without_at():
-    st = {"telegram_engage_chat_caps": {"@ouroborosagent": {"addressed": 20, "reply": 6}}}
-    assert _chat_caps(st, "@ouroborosagent") == (6, 20)
-    st2 = {"telegram_engage_chat_caps": {"ouroborosagent": {"addressed": 15}}}
-    assert _chat_caps(st2, "@ouroborosagent") == (PER_CHAT_REPLY_DAILY_CAP, 15)
+    st = {"telegram_engage_chat_caps": {"@examplechat": {"addressed": 20, "reply": 6}}}
+    assert _chat_caps(st, "@examplechat") == (6, 20)
+    st2 = {"telegram_engage_chat_caps": {"examplechat": {"addressed": 15}}}
+    assert _chat_caps(st2, "@examplechat") == (PER_CHAT_REPLY_DAILY_CAP, 15)
 
 
 def test_override_clamped_against_bad_state_writes():

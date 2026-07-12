@@ -1,4 +1,32 @@
+import concurrent.futures
+import json
+
 from telegram_presence import engage as te
+
+
+def _assessment(message_id, action="ignore", **fields):
+    row = {
+        "message_id": message_id,
+        "addressed_to": "self",
+        "addressed_to_entity": "",
+        "self_is_addressee": "yes",
+        "self_is_referent": "yes",
+        "address_confidence": 0.9,
+        "context_sufficient": 0.9,
+        "referent": "Rain",
+        "inner_thought": "test thought",
+        "motivation": "test motivation",
+        "want": "no" if action == "ignore" else "yes",
+        "action": action,
+    }
+    if action in {"reply", "delegate"}:
+        row["depth"] = "deep" if action == "delegate" else "quick"
+    row.update(fields)
+    return row
+
+
+def _assessment_json(message_id, action="ignore", **fields):
+    return json.dumps([_assessment(message_id, action, **fields)])
 
 
 # --- T3 skeleton ---
@@ -63,7 +91,7 @@ def test_decider_cannot_act_on_non_candidate_message_id(tmp_path):
            "recent": [{"message_id": 2, "snippet": "external", "sender_id": 7}]}
     res, _saved, replies, reacts, notifs = _run(
         _base_state(), pkt, drive_root=tmp_path,
-        decider=lambda p: '[{"message_id":1,"action":"reply","text":"self-loop"}]')
+        decider=lambda p: _assessment_json(1, "reply", text="self-loop"))
     assert res["status"] == "skipped"
     assert replies == []
     assert reacts == []
@@ -106,16 +134,68 @@ def test_validate_drops_oversize_and_empty_reply():
     assert all(p.action != "reply" or (0 < len(p.text) <= te.ENGAGE_MAX_REPLY_CHARS) for p in out)
 
 
+def test_threaded_addressed_reply_does_not_prepend_sender_handle():
+    plan = te.ActionPlan(42, "reply", text="hello")
+    candidate = te.Candidate(42, True, "question", sender_username="alice")
+
+    result = te.apply_reply_addressing([plan], cand_by_id={42: candidate})
+
+    assert result[0].text == "hello"
+
+
+def test_standalone_addressed_reply_prepends_sender_handle_within_limit():
+    plan = te.ActionPlan(0, "reply", text="x" * te.ENGAGE_MAX_REPLY_CHARS)
+    candidate = te.Candidate(0, True, "question", sender_username="alice")
+
+    result = te.apply_reply_addressing([plan], cand_by_id={0: candidate})
+
+    assert result[0].text.startswith("@alice ")
+    assert len(result[0].text) == te.ENGAGE_MAX_REPLY_CHARS
+
+
+def test_existing_sender_handle_match_is_case_insensitive_and_bounded():
+    candidate = te.Candidate(0, True, "question", sender_username="alice")
+    exact = te.ActionPlan(0, "reply", text="@Alice hello")
+    prefix_collision = te.ActionPlan(0, "reply", text="@alice2 hello")
+
+    exact_result = te.apply_reply_addressing([exact], cand_by_id={0: candidate})[0]
+    collision_result = te.apply_reply_addressing([prefix_collision], cand_by_id={0: candidate})[0]
+
+    assert exact_result.text == "@Alice hello"
+    assert collision_result.text == "@alice @alice2 hello"
+
+
+def test_delegated_reply_uses_same_addressing_policy():
+    plan = te.ActionPlan(0, "reply", text="deep answer", delegated=True)
+    candidate = te.Candidate(0, True, "question", sender_username="alice")
+
+    result = te.apply_reply_addressing([plan], cand_by_id={0: candidate})
+
+    assert result[0].text == "@alice deep answer"
+    assert result[0].delegated is True
+
+
+def test_standalone_delegated_reply_preserves_delegate_length_budget():
+    plan = te.ActionPlan(0, "reply", text="x" * 1000, delegated=True)
+    candidate = te.Candidate(0, True, "question", sender_username="alice")
+
+    result = te.apply_reply_addressing([plan], cand_by_id={0: candidate})
+
+    assert result[0].text.startswith("@alice ")
+    assert len(result[0].text) == 1007
+
+
 # --- T5 gate + orchestrator ---
 def _base_state():
     return {"telegram_engage_enabled": True, "autonomy_enabled": True,
-            "owner_chat_id": 99, "telegram_mentions_chat": "@abstractdl_chat",
+            "owner_chat_id": 99, "telegram_mentions_chat": "@examplechat",
             "telegram_engage": {}}
 
 
 def _ok_packet():
     return {"status": "ok",
-            "matches": [{"message_id": 1, "snippet": "@rain hi", "sender_id": 7}],
+            "matches": [{"message_id": 1, "snippet": "@rain hi", "sender_id": 7,
+                         "matched_terms": ["@rain"]}],
             "recent": []}
 
 
@@ -133,7 +213,7 @@ def _run(st, packet, *, drive_root, replies=None, reacts=None, notifs=None,
         load_state=lambda: dict(st),
         save_state=save,
         fetch_candidates=lambda dr: packet,
-        run_decider=decider or (lambda prompt: '[{"message_id":1,"action":"reply","text":"hi"}]'),
+        run_decider=decider or (lambda prompt: _assessment_json(1, "reply", text="hi")),
         do_reply=lambda peer, mid, text: replies.append((peer, mid, text)) or True,
         do_react=lambda peer, mid, emoji: reacts.append((peer, mid, emoji)) or True,
         notify=lambda t: notifs.append(t),
@@ -176,6 +256,52 @@ def test_reply_executes_and_logs(tmp_path):
     assert (tmp_path / "state" / "telegram_engage_actions.jsonl").exists()
 
 
+def test_late_reply_and_react_failures_do_not_complete_or_advance_cursor(tmp_path):
+    for action in ("reply", "react"):
+        root = tmp_path / action
+        root.mkdir()
+        state = _base_state()
+        saved = {}
+        packet = {
+            "status": "ok",
+            "max_ts": 1234.0,
+            "matches": [{
+                "message_id": 1,
+                "snippet": "@rain hi",
+                "sender_id": 7,
+                "matched_terms": ["@rain"],
+            }],
+            "recent": [],
+        }
+        plan = _assessment(1, action, reason="test")
+        if action == "reply":
+            plan["text"] = "hello"
+        else:
+            plan["emoji"] = "👍"
+        failed: concurrent.futures.Future = concurrent.futures.Future()
+        failed.set_exception(RuntimeError(f"late {action} outage"))
+
+        result = te.run_telegram_engage_cycle(
+            drive_root=root,
+            load_state=lambda: dict(state),
+            save_state=lambda value: saved.update(value),
+            fetch_candidates=lambda _root, **_kwargs: packet,
+            run_decider=lambda _prompt: json.dumps([plan]),
+            do_reply=lambda *_args: failed,
+            do_react=lambda *_args: failed,
+            notify=lambda _text: None,
+            now=1000.0,
+        )
+
+        assert result["acted"] == 0 and result["retryable_failure"] is True
+        assert "packet_max_ts" not in result
+        assert not (root / te.ACTION_LOG_REL).exists()
+        ledger = saved["telegram_engage"]
+        assert ledger["reply_count_today"] == 0
+        assert ledger["react_count_today"] == 0
+        assert ledger.get("spool_consumed_ts", 0) == 0
+
+
 
 
 def test_does_not_reply_twice_to_same_message_id(tmp_path):
@@ -196,12 +322,12 @@ def test_does_not_react_twice_to_same_chat_message_id(tmp_path):
     log_dir = tmp_path / "state"
     log_dir.mkdir()
     (log_dir / "telegram_engage_actions.jsonl").write_text(
-        '{"ts": 999.0, "chat": "@abstractdl_chat", "action": "react", "message_id": 1, "emoji": "👍"}\n',
+        '{"ts": 999.0, "chat": "@examplechat", "action": "react", "message_id": 1, "emoji": "👍"}\n',
         encoding="utf-8",
     )
     res, _saved, replies, reacts, notifs = _run(
         _base_state(), _ok_packet(), drive_root=tmp_path,
-        decider=lambda p: '[{"message_id":1,"action":"react","emoji":"🔥"}]')
+        decider=lambda p: _assessment_json(1, "react", emoji="🔥"))
     assert res["status"] == "skipped"
     assert replies == []
     assert reacts == []
@@ -216,13 +342,13 @@ def test_dedup_is_scoped_by_chat(tmp_path):
     )
     res, _saved, replies, reacts, notifs = _run(_base_state(), _ok_packet(), drive_root=tmp_path)
     assert res["status"] == "acted"
-    assert replies == [("@abstractdl_chat", 1, "hi")]
+    assert replies == [("@examplechat", 1, "hi")]
 
 
 def test_action_log_records_chat_for_future_dedup(tmp_path):
     res, saved, replies, reacts, notifs = _run(_base_state(), _ok_packet(), drive_root=tmp_path)
     row = (tmp_path / "state" / "telegram_engage_actions.jsonl").read_text(encoding="utf-8")
-    assert '"chat": "@abstractdl_chat"' in row
+    assert '"chat": "@examplechat"' in row
 
 def test_min_gap_blocks_second_proactive_action(tmp_path):
     st = _base_state(); st["telegram_engage"] = {"last_action_ts": 1000.0}
@@ -269,7 +395,7 @@ def test_never_raises_on_bad_decider(tmp_path):
 def test_react_action_executes(tmp_path):
     res, saved, replies, reacts, notifs = _run(
         _base_state(), _ok_packet(), drive_root=tmp_path,
-        decider=lambda p: '[{"message_id":1,"action":"react","emoji":"🔥"}]')
+        decider=lambda p: _assessment_json(1, "react", emoji="🔥"))
     assert res["status"] == "acted"
     assert reacts and reacts[0][2] == "🔥"
 
@@ -277,7 +403,9 @@ def test_react_action_executes(tmp_path):
 def test_notify_owner_action(tmp_path):
     res, saved, replies, reacts, notifs = _run(
         _base_state(), _ok_packet(), drive_root=tmp_path,
-        decider=lambda p: '[{"message_id":1,"action":"notify_owner","reason":"relevant AI paper"}]')
+        decider=lambda p: _assessment_json(
+            1, "notify_owner", reason="relevant AI paper",
+        ))
     assert notifs and "relevant AI paper" in notifs[0]
 
 
@@ -423,10 +551,11 @@ def test_per_chat_resets_on_new_day():
 
 # --- burst coalescing (2026-07-08) ---
 
-def _cand(mid, sender, snippet, ts, addressed=False, kind="none", username=None):
+def _cand(mid, sender, snippet, ts, addressed=False, kind="none", username=None,
+          topic_id=None):
     return te.Candidate(mid, addressed, snippet, sender_id=sender,
                         sender_username=username or f"u{sender}",
-                        addressed_kind=kind, ts=ts)
+                        addressed_kind=kind, ts=ts, topic_id=topic_id)
 
 
 def test_coalesce_merges_same_sender_burst():
@@ -464,7 +593,45 @@ def test_coalesce_strongest_kind_wins():
     assert len(out) == 1 and out[0].addressed_kind == "reply"
 
 
+def test_coalesce_splits_same_sender_when_explicit_target_changes():
+    cands = [
+        te.Candidate(
+            1, True, "@rain first", sender_id=7, sender_username="u7",
+            addressed_kind="mention", mentioned_handles=("@rain",), ts=100.0,
+        ),
+        te.Candidate(
+            2, False, "@bob your turn", sender_id=7, sender_username="u7",
+            addressed_kind="none", mentions_other=True,
+            mentioned_handles=("@bob",), ts=110.0,
+        ),
+    ]
+
+    out = te.coalesce_candidates(cands)
+
+    assert [candidate.message_id for candidate in out] == [1, 2]
+
+
 def test_coalesce_never_merges_across_senders():
     cands = [_cand(1, 7, "a", 100.0), _cand(2, 8, "b", 101.0), _cand(3, 7, "c", 102.0)]
     out = te.coalesce_candidates(cands)
     assert [c.message_id for c in out] == [1, 2, 3]
+
+
+def test_coalesce_never_merges_across_forum_topics():
+    cands = [
+        _cand(1, 7, "topic one", 100.0, topic_id=10),
+        _cand(2, 7, "topic two", 101.0, topic_id=20),
+    ]
+
+    assert [c.message_id for c in te.coalesce_candidates(cands)] == [1, 2]
+
+
+def test_decider_prompt_warns_about_third_person_referents():
+    """Regression: Ashe's «Я тоже хочу с ней поговорить» (about another bot,
+    Рина) was read as being about Rain herself (2026-07-11)."""
+    c = te.Candidate(message_id=1, addressed=False, snippet="Я тоже хочу с ней поговорить",
+                     sender_id=9, addressed_kind="none")
+    prompt = te.build_decider_prompt([c])
+    assert "Third-person pronouns" in prompt
+    assert "Do not default them to yourself" in prompt
+    assert "transport/structure CUES, not a verdict" in prompt

@@ -483,7 +483,12 @@ def _run_cycle_with(do_reply, packet, drive_root):
                             "telegram_mentions_chat": "@examplechat"},
         save_state=lambda s: None,
         fetch_candidates=lambda dr, chat=None, after_ts=None: packet,
-        run_decider=lambda p: '[{"message_id":11,"action":"reply","text":"ответ","want":"yes","depth":"quick"}]',
+        run_decider=lambda p: (
+            '[{"message_id":11,"action":"reply","text":"ответ","want":"yes","depth":"quick",'
+            '"addressed_to":"self","addressed_to_entity":"","self_is_addressee":"yes",'
+            '"self_is_referent":"yes","address_confidence":0.9,"context_sufficient":0.9,'
+            '"referent":"the agent","inner_thought":"greet back","motivation":"direct hello"}]'
+        ),
         do_reply=do_reply,
         do_react=lambda *a: True,
         notify=lambda t: None, now=1000.0)

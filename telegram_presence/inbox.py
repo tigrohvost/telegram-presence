@@ -1,9 +1,15 @@
 """Realtime group-mention inbox: addressed detection + bounded jsonl spool.
 
-Fed by TelegramUserBridge group events; consumed by the engage organ.
+Fed by a live transport (Bot API / Telethon); consumed by the engage organ.
 No LLM here; group text is untrusted evidence — sanitized snippets only.
-Detection logic mirrors scripts/rain_telethon_mentions.py (kept as the
-backfill/diagnostic tool).
+
+Persistence is fail-closed: a row is only ACKable upstream after it has been
+flushed and fsynced (``InboxAddResult.safe_to_ack``), a torn final line is
+repaired before the next append, and recent durable ids are re-hydrated on
+restart so a transport replay is a no-op. Every appended row carries a
+monotonic ``spool_seq`` (crash-safe sidecar counter under the same lock), so
+queue consumers can use an exact sequence cursor instead of wall-clock
+timestamps that collide inside one second.
 """
 from __future__ import annotations
 
@@ -30,8 +36,11 @@ log = logging.getLogger(__name__)
 
 SPOOL_REL = Path("state") / "telegram_group_inbox.jsonl"
 RECEIPT_REL = Path("state") / "telegram_addressed_mentions_monitor.json"
+SPOOL_SEQ_REL = Path("state") / "telegram_group_inbox.seq"
 MAX_SPOOL_BYTES = 1_000_000
+MAX_SPOOL_RETAIN_ROWS = 500
 MAX_SNIPPET_CHARS = 500
+MAX_ADDRESSED_FULL_TEXT_CHARS = 4096
 MAX_SEEN_IDS = 2048
 MAX_OWN_IDS = 200
 
@@ -94,13 +103,21 @@ def matched_terms(text: str | None, names: tuple[str, ...] | None = None) -> lis
 
 
 def sanitize_snippet(text: str | None, max_chars: int = MAX_SNIPPET_CHARS) -> str:
-    if not text:
-        return ""
-    cleaned = "".join(ch if (ch.isprintable() or ch in "\r\n\t") else " " for ch in str(text))
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return _cap_normalized_snippet(_normalize_snippet(text), max_chars=max_chars)
+
+
+def _cap_normalized_snippet(cleaned: str, max_chars: int = MAX_SNIPPET_CHARS) -> str:
     if len(cleaned) > max_chars:
         return cleaned[: max_chars - 1].rstrip() + "…"
     return cleaned
+
+
+def _normalize_snippet(text: str | None) -> str:
+    """Normalize group text without applying the persisted snippet cap."""
+    if not text:
+        return ""
+    cleaned = "".join(ch if (ch.isprintable() or ch in "\r\n\t") else " " for ch in str(text))
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def clean_handle(value: Optional[str]) -> Optional[str]:
@@ -109,6 +126,21 @@ def clean_handle(value: Optional[str]) -> Optional[str]:
         return None
     handle = str(value).strip().lstrip("@").strip()
     return handle or None
+
+
+def _chat_key(value: Any) -> str:
+    return str(value or "").strip().lstrip("@").lower()
+
+
+def canonical_chat_peer(value: Any) -> str:
+    """Stable Telegram peer spelling for storage, deduplication, and sending."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    bare = text.lstrip("@")
+    if text.startswith("@") or any(char.isalpha() or char == "_" for char in bare):
+        return "@" + bare.lower()
+    return text
 
 
 def allowed_chats(st: Optional[dict] = None) -> list[str]:
@@ -125,10 +157,10 @@ def allowed_chats(st: Optional[dict] = None) -> list[str]:
     seen: set[str] = set()
 
     def _add(value: Any) -> None:
-        text = str(value or "").strip()
+        text = canonical_chat_peer(value)
         if not text:
             return
-        key = text.lstrip("@").lower()
+        key = _chat_key(text)
         if key and key not in seen:
             seen.add(key)
             chats.append(text)
@@ -146,7 +178,7 @@ def allowed_chats(st: Optional[dict] = None) -> list[str]:
     except Exception:
         pass
     # No default chat: an unconfigured inbox must stay silent. The old
-    # @abstractdl_chat fallback kept re-attaching readers to a retired chat
+    # hardcoded fallback kept re-attaching readers to a retired chat
     # (live incident 2026-07-09: cross-chat ghost replies).
     return chats
 
@@ -181,21 +213,26 @@ class GroupInbox:
         self._root = Path(drive_root)
         self._spool = self._root / SPOOL_REL
         self._receipt = self._root / RECEIPT_REL
+        self._seq_path = self._root / SPOOL_SEQ_REL
         self._storage_lock_path = self._spool.parent / ".telegram_group_inbox.lock"
         self._lock = threading.Lock()
         self._seen: set[tuple[str, int]] = set()
         self._seen_order: deque[tuple[str, int]] = deque(maxlen=MAX_SEEN_IDS)
-        self._own_ids: deque[int] = deque(maxlen=MAX_OWN_IDS)
+        self._own_ids: deque[tuple[str, int]] = deque(maxlen=MAX_OWN_IDS)
         self._load_seen_from_spool()
 
-    def remember_own_message(self, message_id: int) -> None:
+    def remember_own_message(self, chat: Any, message_id: int) -> None:
         with self._lock:
-            self._own_ids.append(int(message_id))
+            self._own_ids.append((_chat_key(chat), int(message_id)))
 
     def add_message(self, *, chat: str, message_id: int, sender_id: Optional[int],
                     text: str, reply_to_msg_id: Optional[int], self_id: Optional[int],
                     sender_username: Optional[str] = None, sender_name: Optional[str] = None,
-                    now: Optional[float] = None) -> bool:
+                    topic_id: Optional[int] = None, now: Optional[float] = None,
+                    addressed_hint: bool = False,
+                    matched_terms_hint: Optional[list[Any]] = None,
+                    full_text_complete: Optional[bool] = None,
+                    original_chars_hint: Optional[int] = None) -> bool:
         """Spool one group message. Returns True when a row was written."""
         return self.ingest_message(
             chat=chat,
@@ -206,14 +243,24 @@ class GroupInbox:
             self_id=self_id,
             sender_username=sender_username,
             sender_name=sender_name,
+            topic_id=topic_id,
             now=now,
+            addressed_hint=addressed_hint,
+            matched_terms_hint=matched_terms_hint,
+            full_text_complete=full_text_complete,
+            original_chars_hint=original_chars_hint,
         ).written
 
     def ingest_message(self, *, chat: str, message_id: int, sender_id: Optional[int],
                        text: str, reply_to_msg_id: Optional[int], self_id: Optional[int],
                        sender_username: Optional[str] = None,
                        sender_name: Optional[str] = None,
-                       now: Optional[float] = None) -> InboxAddResult:
+                       topic_id: Optional[int] = None,
+                       now: Optional[float] = None,
+                       addressed_hint: bool = False,
+                       matched_terms_hint: Optional[list[Any]] = None,
+                       full_text_complete: Optional[bool] = None,
+                       original_chars_hint: Optional[int] = None) -> InboxAddResult:
         """Spool one message and expose whether a transport may ACK it.
 
         The seen-id cache is updated only after the jsonl row has been flushed
@@ -225,22 +272,42 @@ class GroupInbox:
         except (TypeError, ValueError):
             return InboxAddResult(False, True, "invalid_message_id")
         if self_id is not None and sender_id == self_id:
-            self.remember_own_message(mid)
+            self.remember_own_message(chat, mid)
             return InboxAddResult(False, True, "own_message")
-        key = (str(chat), mid)
+        key = (_chat_key(chat), mid)
         terms = matched_terms(text)
+        seen_terms = {term.casefold() for term in terms}
+        if isinstance(matched_terms_hint, list):
+            for raw_term in matched_terms_hint[:16]:
+                term = sanitize_snippet(str(raw_term or ""), 80)
+                if term and term.casefold() not in seen_terms:
+                    terms.append(term)
+                    seen_terms.add(term.casefold())
         from .hooks import redact
         redacted_text = redact(text)
         redacted_sender_username = redact(sender_username or "")
         redacted_sender_name = redact(sender_name or "")
-        persisted_terms = [sanitize_snippet(redact(term), 64) for term in terms]
+        persisted_terms = [sanitize_snippet(redact(term), 80) for term in terms]
 
         with self._lock:
             if key in self._seen:
                 return InboxAddResult(False, True, "duplicate")
             own_ids = set(self._own_ids)
-            reply_to_me = reply_to_msg_id is not None and int(reply_to_msg_id) in own_ids
-            addressed = bool(terms) or reply_to_me
+            reply_to_me = (
+                reply_to_msg_id is not None
+                and (_chat_key(chat), int(reply_to_msg_id)) in own_ids
+            )
+            addressed = bool(terms) or reply_to_me or bool(addressed_hint)
+            normalized_text = _normalize_snippet(redacted_text)
+            snippet = _cap_normalized_snippet(normalized_text)
+            truncated = normalized_text != snippet
+            try:
+                original_chars = max(
+                    len(normalized_text),
+                    min(10_000_000, int(original_chars_hint)),
+                )
+            except (TypeError, ValueError):
+                original_chars = len(normalized_text)
             row = {
                 "ts": time.time() if now is None else float(now),
                 "chat": str(chat),
@@ -251,11 +318,23 @@ class GroupInbox:
                 "reply_to_msg_id": (
                     int(reply_to_msg_id) if reply_to_msg_id is not None else None
                 ),
+                "topic_id": (int(topic_id) if topic_id is not None else None),
                 "addressed": addressed,
                 "matched_terms": persisted_terms + (["reply_to_me"] if reply_to_me else []),
-                "snippet": sanitize_snippet(redacted_text),
+                "snippet": snippet,
+                "truncated": truncated,
+                "original_chars": original_chars,
                 "untrusted_external_text": True,
             }
+            if addressed and truncated:
+                # Progressive disclosure: the light decider sees only
+                # ``snippet``; the deep composer can recover the explicit
+                # question without retaining full unaddressed group chatter.
+                row["full_text"] = normalized_text[:MAX_ADDRESSED_FULL_TEXT_CHARS]
+                row["full_text_complete"] = (
+                    len(normalized_text) <= MAX_ADDRESSED_FULL_TEXT_CHARS
+                    and full_text_complete is not False
+                )
             try:
                 appended = self._append(row)
             except Exception:
@@ -275,26 +354,98 @@ class GroupInbox:
             log.debug("telegram_group_inbox: roster observe failed", exc_info=True)
         return InboxAddResult(True, True, "written")
 
-    def pending(self, after_ts: float = 0.0, limit: int = 50) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
+    def snapshot_seq(self) -> int:
+        """Highest sequence durably present in the spool at one locked instant."""
         try:
+            with self._lock:
+                with self._storage_locked():
+                    watermark = 0
+                    ordinal = 0
+                    with self._spool.open("r", encoding="utf-8") as spool_handle:
+                        for line in spool_handle:
+                            try:
+                                row = json.loads(line)
+                            except Exception:
+                                continue
+                            if not isinstance(row, dict):
+                                continue
+                            ordinal += 1
+                            try:
+                                watermark = max(
+                                    watermark, int(row.get("spool_seq") or ordinal),
+                                )
+                            except (TypeError, ValueError):
+                                watermark = max(watermark, ordinal)
+                    return watermark
+        except FileNotFoundError:
+            return 0
+        except Exception:
+            log.debug("telegram_group_inbox: snapshot watermark failed", exc_info=True)
+        return 0
+
+    def pending(
+        self,
+        after_ts: float = 0.0,
+        limit: int = 50,
+        *,
+        after_seq: Optional[int] = None,
+        chat: Any = None,
+        oldest_first: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded spool view.
+
+        ``chat`` is applied before ``limit`` so traffic in one group cannot
+        evict another group's unread rows from every fetch.  UI/history callers
+        keep the legacy newest-first window by default; queue consumers opt
+        into ``oldest_first`` so advancing their cursor cannot skip backlog.
+        """
+        rows: list[dict[str, Any]] = []
+        want_chat = _chat_key(chat) if chat is not None else None
+        try:
+            ordinal = 0
             with self._spool.open("r", encoding="utf-8") as fh:
                 for line in fh:
                     try:
                         row = json.loads(line)
                     except Exception:
                         continue
-                    if isinstance(row, dict) and float(row.get("ts") or 0) > after_ts:
-                        rows.append(row)
+                    if not isinstance(row, dict):
+                        continue
+                    ordinal += 1
+                    try:
+                        spool_seq = int(row.get("spool_seq") or ordinal)
+                    except (TypeError, ValueError):
+                        spool_seq = ordinal
+                    row["spool_seq"] = spool_seq
+                    if after_seq is not None:
+                        if spool_seq <= int(after_seq):
+                            continue
+                    elif float(row.get("ts") or 0) <= after_ts:
+                        continue
+                    if want_chat is not None and _chat_key(row.get("chat")) != want_chat:
+                        continue
+                    rows.append(row)
         except FileNotFoundError:
             return []
         except Exception:
             log.warning("telegram_group_inbox: spool read failed", exc_info=True)
             return []
-        return rows[-limit:]
+        try:
+            bounded = max(0, int(limit))
+        except (TypeError, ValueError):
+            bounded = 50
+        if bounded == 0:
+            return []
+        return rows[:bounded] if oldest_first else rows[-bounded:]
 
-    def has_unconsumed_addressed(self, after_ts: float = 0.0) -> bool:
-        return any(r.get("addressed") for r in self.pending(after_ts=after_ts))
+    def has_unconsumed_addressed(
+        self, after_ts: float = 0.0, *, after_seq: Optional[int] = None,
+        chat: Any = None,
+    ) -> bool:
+        return any(
+            r.get("addressed")
+            for r in self.pending(after_ts=after_ts, after_seq=after_seq, chat=chat)
+        )
 
     # -- internals --
 
@@ -319,7 +470,7 @@ class GroupInbox:
         for line in lines:
             try:
                 row = json.loads(line)
-                key = (str(row["chat"]), int(row["message_id"]))
+                key = (_chat_key(row["chat"]), int(row["message_id"]))
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
             self._remember_seen_unlocked(key)
@@ -399,7 +550,7 @@ class GroupInbox:
                 for line in source:
                     try:
                         row = json.loads(line)
-                        candidate = (str(row["chat"]), int(row["message_id"]))
+                        candidate = (_chat_key(row["chat"]), int(row["message_id"]))
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                         continue
                     if candidate == key:
@@ -408,14 +559,61 @@ class GroupInbox:
             return False
         return False
 
-    def _rotate_locked(self) -> None:
+    def _next_seq_locked(self) -> int:
+        """Reserve the next monotonic spool sequence (sidecar + fsync)."""
+        last_seq = 0
         try:
-            if self._spool.stat().st_size <= MAX_SPOOL_BYTES:
+            last_seq = int(self._seq_path.read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            try:
+                ordinal = 0
+                with self._spool.open("r", encoding="utf-8") as existing:
+                    for line in existing:
+                        try:
+                            item = json.loads(line)
+                        except Exception:
+                            continue
+                        if not isinstance(item, dict):
+                            continue
+                        ordinal += 1
+                        try:
+                            last_seq = max(
+                                last_seq, int(item.get("spool_seq") or ordinal),
+                            )
+                        except (TypeError, ValueError):
+                            last_seq = max(last_seq, ordinal)
+            except FileNotFoundError:
+                pass
+        next_seq = last_seq + 1
+        seq_tmp = self._seq_path.with_name(
+            f".{self._seq_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        with seq_tmp.open("w", encoding="utf-8") as seq_handle:
+            seq_handle.write(f"{next_seq}\n")
+            seq_handle.flush()
+            os.fsync(seq_handle.fileno())
+        os.replace(seq_tmp, self._seq_path)
+        return next_seq
+
+    def _rotate_locked(self, incoming_bytes: int = 0) -> None:
+        try:
+            if self._spool.stat().st_size + incoming_bytes <= MAX_SPOOL_BYTES:
                 return
         except FileNotFoundError:
             return
-        keep = self._spool.read_text(encoding="utf-8").splitlines()[-500:]
-        payload = (("\n".join(keep) + "\n") if keep else "").encode("utf-8")
+        # Bound by encoded bytes, not row count: long addressed rows carry
+        # ``full_text`` and 500 of them can exceed the byte cap on their own.
+        budget = max(0, MAX_SPOOL_BYTES - incoming_bytes)
+        lines = self._spool.read_bytes().splitlines(keepends=True)
+        kept_newest: list[bytes] = []
+        kept_bytes = 0
+        for raw_line in reversed(lines[-MAX_SPOOL_RETAIN_ROWS:]):
+            line = raw_line if raw_line.endswith(b"\n") else raw_line + b"\n"
+            if kept_bytes + len(line) > budget:
+                break
+            kept_newest.append(line)
+            kept_bytes += len(line)
+        payload = b"".join(reversed(kept_newest))
         temporary_name: Optional[str] = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -442,8 +640,7 @@ class GroupInbox:
 
     def _append(self, row: dict[str, Any]) -> bool:
         """Append one private durable row; return False for an on-disk duplicate."""
-        key = (str(row["chat"]), int(row["message_id"]))
-        encoded = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+        key = (_chat_key(row["chat"]), int(row["message_id"]))
         with self._storage_locked():
             self._repair_torn_tail_locked()
             if self._spool_contains_key_locked(key):
@@ -451,7 +648,9 @@ class GroupInbox:
                 # to advance the upstream cursor.
                 self._fsync_directory(self._spool.parent)
                 return False
-            self._rotate_locked()
+            row["spool_seq"] = self._next_seq_locked()
+            encoded = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+            self._rotate_locked(len(encoded))
             descriptor = os.open(
                 self._spool,
                 os.O_CREAT | os.O_APPEND | os.O_WRONLY,

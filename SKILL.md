@@ -1,6 +1,6 @@
 ---
 name: telegram-presence
-description: Use when an LLM agent needs a live presence in Telegram group chats — deciding whether it wants to speak at all, escalating substantive questions, anchoring replies, and keeping decisions observable — or needs reusable durable Telegram delivery guarantees. Works over the official Bot API (stdlib only) or an injected Telethon user account. Trigger on: "group chat presence", "agent in a Telegram group", "when should the bot reply", "engage loop", "want gate", "durable Telegram delivery", "Telegram outbox", "Telegram retries", "owner-only private chat", "message chunking".
+description: Use when an LLM agent needs a live presence in Telegram group chats — reading the social scene per message (who is addressed, who is the referent, is it about me or to me), deciding whether it wants to speak at all (want/depth gate + wait), escalating substantive questions to a full-model composer, remembering third-party bots/personas so sound-alike names are never self-attributed, delivering replies through durable outboxes, and keeping every decision observable in a jsonl log. Works over the official Bot API (stdlib only) or a Telethon user account. Trigger on: "group chat presence", "agent in a Telegram group", "when should the bot reply", "engage loop", "want gate", "social read", "addressee detection".
 ---
 
 # telegram-presence — group-chat presence for an LLM agent
@@ -8,9 +8,11 @@ description: Use when an LLM agent needs a live presence in Telegram group chats
 ## When to use
 
 The host agent must participate in a Telegram **group** like a person with
-judgment, not like a bot that answers everything: ignore noise, drop
-politeness-only replies, answer substantive questions deeply, keep per-chat
-caps, and leave an audit trail of every decision. For 1:1 bot conversations
+judgment, not like a bot that answers everything: understand who each message
+is addressed to and who it is about (a thread ABOUT the agent is not a thread
+TO the agent), ignore noise, drop politeness-only replies, answer substantive
+questions deeply, hold a thought while the floor is still moving (`wait`),
+keep per-chat caps, and leave an audit trail of every decision. For 1:1 bot conversations
 the engage cycle is the wrong tool — it is specifically the *group presence
 organ*. The owner-only private policy below is a reusable transport guard, not
 a second engage path.
@@ -100,6 +102,21 @@ currently reconcile delayed ACKs into its action log and caps.
 
 - **Silence is a valid answer.** The decider must emit `want: yes/no` per
   message; `want=no` drops the reply. Never "fix" this by forcing replies.
+- **The social read is perception, not permission.** `addressed_to`,
+  `referent`, `self_is_addressee`, `self_is_referent` are the model's
+  first-class judgment; policy layers only *observe* them (trace rows in the
+  decision log). Hard enforcement lives in transport cues, autonomy switches,
+  rate caps, and memory provenance — never in keyword semantics.
+- **One assessment object per message, every message.** An empty, partial,
+  duplicate, or truncated decider response is invalid: it quarantines that
+  forum topic after bounded retries and must not consume the spool cursor.
+- **Group actions are durable intents.** Engage replies/reactions go through
+  the SQLite outbox (`group_delivery.py`) — one intent per message+action,
+  dead-letter after exhausted retries. Do not bypass it with raw sends; that
+  reopens the duplicate/lost-answer window.
+- **The entity glossary never contains the agent itself.** `remember_entity`
+  rejects the agent's own name terms; chat claims stay untrusted provenance
+  and never write self-identity.
 - **Chats resolve in exactly one place** — `inbox.allowed_chats()`. Do not
   add a second resolution or a hardcoded default chat; an unconfigured stack
   serves nothing. (This invariant comes from a live incident where a stale

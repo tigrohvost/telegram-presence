@@ -23,28 +23,56 @@ The agent decides *whether it wants to speak at all*, how deep the answer
 should be, and keeps its group behavior observable.
 
 Made with **Rain**'s participation (the Ouroboros project), a live autonomous agent,
-after a week of tuning her group-chat quality against real conversations.
+after a week of tuning her group-chat quality against real conversations —
+and re-synced in v0.3.0 with the next round of her live fixes: a full
+social-read decider contract, an entity glossary against sound-alike
+personas, forum-topic scheduling lanes, and a durable group-action outbox.
 Stdlib only, no Telegram library dependency: all I/O and LLM calls are
 injected callables.
 
 ## What it does
 
-- **want/depth gate** — the light decider must state per message whether the
-  agent *wants* to answer (`want: yes/no`) and how deep (`quick/deep`).
-  `want=no` drops the reply: the agent answers when it has something to say,
-  not out of politeness.
-- **delegate escalation** — substantive or `deep` addressed questions are
-  escalated from the light decider's inline draft to a full composer
-  (knowledge base + per-person memory + conversation thread), with the light
-  draft kept as a fallback so the answer is never lost.
+- **social read before action** — for EVERY message (including ones it
+  ignores) the light decider must first output a social assessment:
+  `addressed_to` (self/group/other/unclear), `referent` (who the words are
+  ABOUT), `self_is_addressee` / `self_is_referent`, confidence readings, and a
+  private `inner_thought` + `motivation` — only then an action. Being talked
+  *about* is not being talked *to*, and neither forces nor forbids speaking;
+  an incomplete assessment batch is rejected instead of half-applied.
+- **want/depth gate** — the decider must state whether the agent *wants* to
+  answer (`want: yes/no`) and how deep (`quick/deep`). `want=no` drops the
+  reply: the agent answers when it has something to say, not out of
+  politeness.
+- **delegate escalation** — substantive or `deep` questions are escalated
+  from the light decider's inline draft to a full composer (knowledge base +
+  per-person memory + conversation scene + the social read itself), with the
+  light draft kept as a fallback so the answer is never lost. Delegated
+  replies are capped at 3500 chars on a sentence boundary, not mid-word.
+- **entity glossary** — a per-chat durable glossary of third-party bots and
+  personas people discuss (`remember_entity`), injected into the prompt with
+  declension-aware matchers, so a sound-alike name (Рина vs Рейн) is never
+  self-attributed. The agent's own name terms can never enter the glossary.
+- **wait & forum-topic lanes** — Telegram forum topics are hard context and
+  scheduling lanes with per-topic spool cursors and round-robin decider
+  batches; `wait` holds a formed thought while the conversational floor is
+  still moving (bounded attempts); a repeatedly invalid decider response
+  quarantines one topic instead of consuming the whole queue.
+- **durable group actions** — engage replies and reactions go through a
+  SQLite outbox (`group_delivery.py`): one durable intent per message+action,
+  at-least-once delivery with a stable Telegram dedup id, exponential
+  retries, and a dead-letter tombstone + owner alert when attempts are
+  exhausted. A pre-send scene revalidation holds drafts if newer turns landed
+  while the model was composing.
 - **burst coalescing** — consecutive messages from the same sender merge into
   one candidate; the reply anchors to the *addressed* message of the burst,
-  not the tail.
+  and a change of addressee or topic splits the burst.
 - **caps & pauses** — per-day and per-chat reply caps, per-chat pauses,
-  kill-file gates, panic flag.
+  kill-file gates, panic flag. Over-cap work is *deferred*, not dropped: the
+  topic cursor parks and the message returns next cycle.
 - **decision log** — every decider batch is logged raw → policy trace →
-  final actions (`state/telegram_engage_decisions.jsonl`), so
-  under-delegation and dropped replies are measurable instead of anecdotal.
+  final actions (`state/telegram_engage_decisions.jsonl`), now including the
+  social read per message, deferred/quarantined topics, and a hash receipt of
+  the private inner thought (presence is auditable, prose is not persisted).
 - **durable, correlated delivery** — outbound intent is represented by a
   transport-aware `MessageEnvelope` and tracked as a `DeliveryRecord`. The
   stdlib-only outbox persists `pending → sending → acked`, records retryable
@@ -58,8 +86,11 @@ injected callables.
   exceeds policy.
 - **addressed detection & spool** — a bounded, fsynced jsonl inbox with
   name/mention matching (including Cyrillic inflections), reply-chain
-  awareness, restart-safe recent-id deduplication, and a roster of participants
-  that accumulates notes across days.
+  awareness, restart-safe recent-id deduplication, a monotonic `spool_seq`
+  cursor written under the storage lock (immune to same-second timestamp
+  collisions), per-chat filtering before the read limit, full-text retention
+  for truncated *addressed* messages, and a roster of participants that
+  accumulates notes across days.
 - **untrusted by construction** — chat text is treated as untrusted input:
   snippets are sanitized and length-capped, secret-like tokens are redacted
   before anything reaches disk, and composer prompts carry an explicit
@@ -68,14 +99,21 @@ injected callables.
 ## Architecture
 
 ```
-inbox.py    — GroupInbox spool, addressed detection, allowed_chats (single
-              source of truth for which chats are served)
-engage.py   — candidates, coalescing, decider prompt, want/depth policy,
-              caps, per-chat cycle, decision log
-delegate.py — composer prompt for substantive answers (KB + memory + thread)
-thread.py   — conversation-thread reconstruction from spool + own replies
-roster.py   — participant notes that accumulate instead of overwrite
+inbox.py    — GroupInbox spool (fail-closed, fsynced, monotonic spool_seq),
+              addressed detection, allowed_chats (single source of truth for
+              which chats are served)
+engage.py   — candidates, coalescing, social-read decider prompt, want/depth
+              and wait policies, topic lanes + quarantine, caps, per-chat
+              cycle, decision log
+delegate.py — composer prompt for substantive answers (KB + memory + scene +
+              social read), sentence-aware reply cap
+thread.py   — multi-party conversation-scene reconstruction from spool + own
+              replies, topic-scoped, with stable message/sender ids
+roster.py   — participant notes that accumulate instead of overwrite +
+              per-chat glossary of third-party entities
 hooks.py    — every host-specific touch point, injectable
+group_delivery.py — durable SQLite outbox for engage replies/reactions
+              (retries, dead-letter, stable dedup ids)
 delivery.py — MessageEnvelope/DeliveryRecord and correlation contract
 outbox.py   — durable delivery states, bounded retries, restart recovery
 policy.py   — immutable numeric owner identity and private-chat policy
@@ -99,13 +137,13 @@ result = run_telegram_engage_cycle(
     drive_root="data",
     load_state=load_my_state,
     save_state=save_my_state,
-    fetch_candidates=my_fetch,     # (drive_root, chat=, after_ts=) -> packet
+    fetch_candidates=my_fetch,     # (drive_root, chat=, after_ts=, after_seq=) -> packet
     run_decider=my_light_llm,      # (prompt) -> str JSON plan
     do_reply=my_send_reply,        # (peer, msg_id, text) -> bool
     do_react=my_send_reaction,     # (peer, msg_id, emoji) -> bool
     notify=my_notify_owner,        # (text) -> None
-    compose_delegate=my_composer,  # optional: full-model composer
-    fetch_history=my_history,      # optional: spool window for threads
+    compose_delegate=my_composer,  # optional: (candidate, thread, chat=, decision=) -> text
+    fetch_history=my_history,      # optional: (chat=) -> spool window for scenes
 )
 ```
 
@@ -284,9 +322,12 @@ answer people from a retired chat.
 ## Tests
 
 ```
-python -m pytest tests/ -q    # no network, no Telegram account
+python -m pytest tests/ -q    # 259 tests, no network, no Telegram account
 python -m pytest tests/test_outbox.py tests/test_transports.py -q
 ```
+
+The engage spool and group-action outbox use POSIX file locks (`fcntl`):
+Linux and macOS.
 
 ## License
 
