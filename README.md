@@ -24,11 +24,31 @@ should be, and keeps its group behavior observable.
 
 Made with **Rain**'s participation (the Ouroboros project), a live autonomous agent,
 after a week of tuning her group-chat quality against real conversations —
-and re-synced in v0.3.0 with the next round of her live fixes: a full
+re-synced in v0.3.0 with the next round of her live fixes: a full
 social-read decider contract, an entity glossary against sound-alike
 personas, forum-topic scheduling lanes, and a durable group-action outbox.
 Stdlib only, no Telegram library dependency: all I/O and LLM calls are
 injected callables.
+
+### v0.3.1 — live Rain + Fable audit
+
+This patch release was checked against Rain's live runtime and reviewed in a
+second-model dialogue with Claude/Fable. It closes three boundary failures:
+
+- legacy `group_actions` databases now migrate in place before the current
+  natural-key index is installed; chat aliases are canonicalized, true
+  duplicate intents are superseded deterministically, and distinct legacy
+  standalone posts (`msg_id=0`) remain distinct;
+- both bundled adapters carry real forum-topic roots into `GroupInbox`.
+  Bot API accepts `message_thread_id` only when `is_topic_message` is true;
+  Telethon requires the independent MTProto `forum_topic` flag before using
+  direct or nested thread roots, while still handling topic starters. Newly
+  discovered topic lanes inherit the safe chat checkpoint, so enabling topic
+  identity cannot replay pre-upgrade history;
+- a failed `save_state` no longer looks fully successful: the cycle returns
+  `state_persisted=false`, `persistence_error="state_save_failed"`, and
+  `retryable_failure=true`. Already ACKed group intents remain deduplicated
+  when the scheduler retries the cycle.
 
 ## What it does
 
@@ -147,6 +167,12 @@ result = run_telegram_engage_cycle(
 )
 ```
 
+Check the returned result before treating the cycle checkpoint as durable.
+If `save_state` raises, `status` still describes the work performed, while
+`state_persisted=false`, `persistence_error`, and `retryable_failure=true`
+tell the scheduler to retry. When `reason` already described the operation it
+is retained as `operation_reason`.
+
 ## Transports — Bot API or Telethon
 
 The cycle only sees `do_reply` / `do_react` callables, so it runs over either
@@ -168,6 +194,12 @@ transport = TelethonTransport(client=client, inbox=inbox,
 client.add_event_handler(transport.on_group_message,
                          events.NewMessage(func=lambda e: e.is_group))
 ```
+
+Both adapters preserve forum-topic identity on ingress. The Bot API adapter
+requires Telegram's explicit `is_topic_message=true` marker before accepting
+`message_thread_id`; the Telethon adapter derives the topic root from its
+reply header (and from a topic-create service message). Ordinary reply chains
+do not become fake topic lanes.
 
 Then hand `transport.do_reply` / `transport.do_react` to
 `run_telegram_engage_cycle`. Reactions over Telethon need a
@@ -322,7 +354,7 @@ answer people from a retired chat.
 ## Tests
 
 ```
-python -m pytest tests/ -q    # 259 tests, no network, no Telegram account
+python -m pytest tests/ -q    # 265 tests, no network, no Telegram account
 python -m pytest tests/test_outbox.py tests/test_transports.py -q
 ```
 

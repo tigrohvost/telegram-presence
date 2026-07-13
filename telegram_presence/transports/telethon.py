@@ -35,6 +35,38 @@ from telegram_presence.delivery import MessageEnvelope, TransportReceipt
 log = logging.getLogger(__name__)
 
 
+def _safe_positive_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _message_topic_id(message: Any) -> Optional[int]:
+    """Extract a Telethon forum-topic root without importing Telethon."""
+    if message is None:
+        return None
+    action = getattr(message, "action", None)
+    if type(action).__name__ == "MessageActionTopicCreate":
+        return _safe_positive_int(getattr(message, "id", None))
+    header = getattr(message, "reply_to", None)
+    # MTProto also uses reply_to_top_id for ordinary message threads and
+    # channel discussions. Only the independent forum_topic flag makes it a
+    # Telegram forum lane.
+    if not bool(getattr(header, "forum_topic", False)):
+        return None
+    direct = _safe_positive_int(getattr(message, "reply_to_top_id", None))
+    if direct is not None:
+        return direct
+    top = _safe_positive_int(getattr(header, "reply_to_top_id", None))
+    if top is not None:
+        return top
+    return _safe_positive_int(getattr(header, "reply_to_msg_id", None))
+
+
 class TelethonTransport:
     """Bridge an injected Telethon client to the engage cycle."""
 
@@ -88,6 +120,7 @@ class TelethonTransport:
                 text=(getattr(event, "raw_text", None)
                       or getattr(msg, "message", None) or ""),
                 reply_to_msg_id=getattr(msg, "reply_to_msg_id", None),
+                topic_id=_message_topic_id(msg),
                 self_id=self._self_id,
             ))
         except Exception:

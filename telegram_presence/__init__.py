@@ -15,6 +15,11 @@ hard scheduling and context lanes with their own cursors and quarantine, can
 ``wait`` on a moving conversational floor, and sends group replies/reactions
 through a durable SQLite outbox with dead-letter tombstones.
 
+Since 0.3.1 bundled transports preserve real Telegram forum-topic roots,
+legacy group-action databases upgrade in place before the current natural-key
+constraint is installed, and engage-cycle state persistence failures are
+reported to the scheduler instead of looking like a fully durable success.
+
 Everything host-specific (LLM calls, Telegram I/O, persona, state store) is
 injected. Reusable outbound primitives add correlated envelopes and a durable,
 bounded-retry outbox without importing Rain or a Telegram SDK.
@@ -31,7 +36,7 @@ from telegram_presence.group_delivery import (
 from telegram_presence.outbox import DurableOutbox
 from telegram_presence.roster import entities_block, list_entities, remember_entity
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __all__ = [
     "hooks",
     "run_telegram_engage_cycle",

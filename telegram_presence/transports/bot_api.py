@@ -129,6 +129,12 @@ class BotApiTransport:
                         and (isinstance(reply_to, bool)
                              or not isinstance(reply_to, int) or reply_to < 1)):
                     raise ValueError("invalid reply target")
+                topic_id = None
+                if msg.get("is_topic_message") is True:
+                    topic_id = msg.get("message_thread_id")
+                    if (isinstance(topic_id, bool)
+                            or not isinstance(topic_id, int) or topic_id < 1):
+                        raise ValueError("invalid forum topic")
                 text = msg.get("text")
                 if text is None:
                     text = msg.get("caption")
@@ -152,6 +158,7 @@ class BotApiTransport:
                 "sender_name": " ".join(names) or None,
                 "text": text,
                 "reply_to_msg_id": reply_to,
+                "topic_id": topic_id,
                 "self_id": self._self_id,
             }
             try:

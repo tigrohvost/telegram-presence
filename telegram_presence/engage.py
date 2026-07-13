@@ -1392,6 +1392,15 @@ def run_telegram_engage_cycle(
             save_state(st)
         except Exception:
             log.warning("telegram_engage: save_state failed", exc_info=True)
+            failed = dict(result)
+            previous_reason = str(failed.get("reason") or "").strip()
+            if previous_reason:
+                failed["operation_reason"] = previous_reason
+            failed["reason"] = "state save failed"
+            failed["state_persisted"] = False
+            failed["persistence_error"] = "state_save_failed"
+            failed["retryable_failure"] = True
+            return failed
         return result
 
     verdict = gate_open(st, drive_root, now)
@@ -1566,9 +1575,12 @@ def _topic_state(pcd: dict[str, Any], topic_id: Optional[int]) -> dict[str, Any]
         topics = {}
         pcd["topics"] = topics
     key = _topic_key(topic_id)
-    entry = topics.setdefault(key, {})
+    entry = topics.get(key)
     if not isinstance(entry, dict):
         entry = {}
+        for cursor_key in ("spool_consumed_ts", "spool_consumed_seq"):
+            if pcd.get(cursor_key) is not None:
+                entry[cursor_key] = pcd[cursor_key]
         topics[key] = entry
     return entry
 
@@ -1583,9 +1595,14 @@ def _candidate_after_topic_cursor(candidate: Candidate, entry: dict[str, Any]) -
     cursor_ts = entry.get("spool_consumed_ts")
     if cursor_ts is not None:
         try:
-            return float(candidate.ts) > float(cursor_ts)
+            candidate_ts = float(candidate.ts)
+            if candidate_ts > 0:
+                return candidate_ts > float(cursor_ts)
         except (TypeError, ValueError):
             pass
+        # Legacy/custom candidate packets may omit both cursor dimensions.
+        # Preserve compatibility rather than treating their default ts=0 as
+        # proven pre-checkpoint history.
     return True
 
 

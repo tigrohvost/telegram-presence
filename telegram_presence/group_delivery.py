@@ -258,6 +258,21 @@ class GroupActionOutbox:
                 "CREATE TABLE IF NOT EXISTS group_action_meta ("
                 "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(group_actions)").fetchall()
+            }
+            added_intent_key = "intent_key" not in columns
+            if added_intent_key:
+                conn.execute(
+                    "ALTER TABLE group_actions ADD COLUMN intent_key "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            if "transport_random_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE group_actions ADD COLUMN transport_random_id "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             now_value = self._now()
             conn.execute(
                 "UPDATE group_actions SET status='retry', next_attempt_at=?, updated_at=?, "
@@ -269,11 +284,97 @@ class GroupActionOutbox:
                     now_value - GROUP_ACTION_SENDING_LEASE_SECONDS,
                 ),
             )
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS group_action_natural_key_idx "
-                "ON group_actions(chat,msg_id,action,intent_key) "
-                "WHERE status!='superseded'"
+            # Older Rain-compatible schemas identified an action by a digest
+            # that included its payload. Rephrasing the same inbound reply
+            # could therefore leave multiple active rows. Canonicalize peer
+            # aliases and retain one natural intent before adding the current
+            # unique index. Standalone msg_id=0 posts remain distinct by their
+            # historical payload-derived identity.
+            action_rows = conn.execute(
+                "SELECT action_id,chat,msg_id,intent_key,transport_random_id,payload "
+                "FROM group_actions"
+            ).fetchall()
+            canonical_updates = [
+                (canonical_chat_peer(row["chat"]), str(row["action_id"]))
+                for row in action_rows
+                if canonical_chat_peer(row["chat"])
+                and canonical_chat_peer(row["chat"]) != str(row["chat"])
+            ]
+            legacy_intent_updates = [
+                (
+                    "legacy-payload:" + hashlib.sha256(
+                        str(row["payload"] or "").encode("utf-8")
+                    ).hexdigest(),
+                    str(row["action_id"]),
+                )
+                for row in action_rows
+                if int(row["msg_id"]) == 0 and not str(row["intent_key"] or "")
+            ]
+            random_id_updates = [
+                (_transport_random_id(str(row["action_id"])), str(row["action_id"]))
+                for row in action_rows
+                if not int(row["transport_random_id"] or 0)
+            ]
+            index_columns = [
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA index_info(group_action_natural_key_idx)"
+                ).fetchall()
+            ]
+            rebuild_natural_index = (
+                added_intent_key
+                or bool(canonical_updates)
+                or bool(legacy_intent_updates)
+                or index_columns != ["chat", "msg_id", "action", "intent_key"]
             )
+            if rebuild_natural_index:
+                conn.execute("DROP INDEX IF EXISTS group_action_natural_key_idx")
+            for canonical, action_id in canonical_updates:
+                conn.execute(
+                    "UPDATE group_actions SET chat=? WHERE action_id=?",
+                    (canonical, action_id),
+                )
+            for intent_key, action_id in legacy_intent_updates:
+                conn.execute(
+                    "UPDATE group_actions SET intent_key=? WHERE action_id=?",
+                    (intent_key, action_id),
+                )
+            for random_id, action_id in random_id_updates:
+                conn.execute(
+                    "UPDATE group_actions SET transport_random_id=? WHERE action_id=?",
+                    (random_id, action_id),
+                )
+            if rebuild_natural_index:
+                duplicates = conn.execute(
+                    "SELECT chat,msg_id,action,intent_key FROM group_actions "
+                    "WHERE status!='superseded' GROUP BY chat,msg_id,action,intent_key "
+                    "HAVING COUNT(*)>1"
+                ).fetchall()
+                for duplicate in duplicates:
+                    rows = conn.execute(
+                        "SELECT action_id,status FROM group_actions "
+                        "WHERE chat=? AND msg_id=? AND action=? AND intent_key=? "
+                        "AND status!='superseded' "
+                        "ORDER BY CASE status WHEN 'acked' THEN 0 WHEN 'pending' THEN 1 "
+                        "WHEN 'retry' THEN 2 WHEN 'sending' THEN 3 ELSE 4 END, "
+                        "created_at, action_id",
+                        (
+                            duplicate["chat"], duplicate["msg_id"],
+                            duplicate["action"], duplicate["intent_key"],
+                        ),
+                    ).fetchall()
+                    winner = str(rows[0]["action_id"])
+                    for stale in rows[1:]:
+                        conn.execute(
+                            "UPDATE group_actions SET status='superseded', updated_at=?, "
+                            "last_error=? WHERE action_id=?",
+                            (now_value, f"superseded_by:{winner}", stale["action_id"]),
+                        )
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS group_action_natural_key_idx "
+                    "ON group_actions(chat,msg_id,action,intent_key) "
+                    "WHERE status!='superseded'"
+                )
             _maybe_prune_terminal_actions(conn, now=now_value)
         os.chmod(self.db_path, 0o600)
 

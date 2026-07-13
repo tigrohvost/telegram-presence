@@ -21,11 +21,32 @@
 
 Сделано при участии **Rain** (проект Ouroboros) — живого автономного агента, чьё поведение
 в групповых чатах этот код обеспечивал, — после недели настройки качества на реальных
-разговорах. В v0.3.0 пересинхронизировано со следующим раундом её живых фиксов:
+разговорах. В v0.3.0 код пересинхронизирован со следующим раундом её живых фиксов:
 полный social-read контракт decider'а, глоссарий сущностей против созвучных
 персонажей, шедулинг по форум-топикам и durable-очередь групповых действий.
 Только стандартная библиотека, без зависимости от Telegram-библиотек:
 весь I/O и все вызовы LLM — инъецируемые колбэки.
+
+### v0.3.1 — аудит live Rain + Fable
+
+Этот патч-релиз проверен на живом runtime Rain и во втором независимом
+диалоге с Claude/Fable. Закрыты три дефекта на границах системы:
+
+- старые БД `group_actions` теперь мигрируют на месте до создания актуального
+  natural-key индекса; алиасы чатов канонизируются, настоящие дубликаты
+  детерминированно supersede'ятся, а разные старые standalone-посты
+  (`msg_id=0`) остаются разными;
+- оба встроенных адаптера передают настоящий корень форум-топика в
+  `GroupInbox`. Bot API принимает `message_thread_id`, только когда
+  `is_topic_message=true`; Telethon требует независимый MTProto-флаг
+  `forum_topic`, прежде чем использовать прямой или вложенный корень thread'а,
+  и отдельно понимает старт топика. Новая topic lane наследует безопасный
+  checkpoint чата, поэтому включение topic identity не переигрывает старую
+  историю;
+- ошибка `save_state` больше не выглядит полностью успешным циклом: результат
+  содержит `state_persisted=false`, `persistence_error="state_save_failed"` и
+  `retryable_failure=true`. Уже ACKed групповые интенты при повторе цикла не
+  отправляются заново.
 
 ## Что умеет
 
@@ -143,6 +164,12 @@ result = run_telegram_engage_cycle(
 )
 ```
 
+Проверяйте результат цикла, прежде чем считать checkpoint durable. Если
+`save_state` выбрасывает исключение, `status` по-прежнему описывает сделанную
+работу, а `state_persisted=false`, `persistence_error` и
+`retryable_failure=true` требуют повтора от scheduler'а. Если `reason` уже
+описывал операцию, он сохраняется как `operation_reason`.
+
 ## Транспорты — Bot API или Telethon
 
 Цикл видит только колбэки `do_reply` / `do_react`, поэтому работает поверх
@@ -164,6 +191,12 @@ transport = TelethonTransport(client=client, inbox=inbox,
 client.add_event_handler(transport.on_group_message,
                          events.NewMessage(func=lambda e: e.is_group))
 ```
+
+Оба адаптера сохраняют идентичность форум-топика на ingress. Bot API адаптер
+принимает `message_thread_id` только при явном маркере Telegram
+`is_topic_message=true`; Telethon получает корень топика из reply-header (или
+из service message создания топика). Обычная reply-цепочка не превращается в
+ложную topic lane.
 
 Дальше отдайте `transport.do_reply` / `transport.do_react` в
 `run_telegram_engage_cycle`. Реакции через Telethon требуют фабрику
@@ -319,7 +352,7 @@ boundary обязан отдельно вызвать `OwnerPrivateChatPolicy`.
 ## Тесты
 
 ```
-python -m pytest tests/ -q    # 259 тестов, без сети, без аккаунта Telegram
+python -m pytest tests/ -q    # 265 тестов, без сети, без аккаунта Telegram
 python -m pytest tests/test_outbox.py tests/test_transports.py -q
 ```
 

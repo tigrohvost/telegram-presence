@@ -326,6 +326,52 @@ def test_forum_topics_use_separate_decider_invocations(tmp_path):
     assert replies == [("@chata", 10, "reply-10"), ("@chata", 20, "reply-20")]
 
 
+def test_new_topic_lane_inherits_chat_cursor_before_replay_filtering(tmp_path):
+    st = _two_chat_state()
+    st["telegram_engage_chats"] = []
+    st["telegram_engage"]["per_chat"]["@chata"]["spool_consumed_seq"] = 5
+    replies = []
+    seen = []
+    # Deliberately return an old row even though a conforming fetcher would
+    # filter it. A newly discovered topic must still start at the safe chat
+    # checkpoint rather than replaying history from zero.
+    packet = {
+        "status": "ok", "max_ts": 60.0, "max_seq": 6,
+        "matches": [
+            {"message_id": 4, "snippet": "@rain old topic row", "sender_id": 7,
+             "matched_terms": ["@rain"], "topic_id": 101,
+             "spool_seq": 4, "ts": 40.0},
+            {"message_id": 6, "snippet": "@rain new topic row", "sender_id": 7,
+             "matched_terms": ["@rain"], "topic_id": 101,
+             "spool_seq": 6, "ts": 60.0},
+        ],
+        "recent": [],
+    }
+
+    def decider(prompt):
+        seen.append(prompt)
+        return _decision(_assessment(6, "reply", text="new only"))
+
+    result = te.run_telegram_engage_cycle(
+        drive_root=tmp_path,
+        load_state=lambda: dict(st),
+        save_state=lambda saved: st.update(saved),
+        fetch_candidates=lambda *_args, **_kwargs: packet,
+        run_decider=decider,
+        do_reply=lambda *args: replies.append(args) or True,
+        do_react=lambda *_args: True,
+        notify=lambda _text: None,
+        now=1000.0,
+    )
+
+    assert result["status"] == "acted"
+    assert len(seen) == 1 and "new topic row" in seen[0]
+    assert "old topic row" not in seen[0]
+    assert replies == [("@chata", 6, "new only")]
+    topic = st["telegram_engage"]["per_chat"]["@chata"]["topics"]["topic:101"]
+    assert topic["spool_consumed_seq"] == 6
+
+
 def test_invalid_forum_topic_does_not_consume_chat_cursor(tmp_path):
     st = _two_chat_state()
     st["telegram_engage_chats"] = []
@@ -819,3 +865,35 @@ def test_bad_topic_does_not_block_later_healthy_and_is_quarantined(tmp_path):
     assert len(quarantine) == 1
     assert quarantine[0]["topic_id"] == 101
     assert quarantine[0]["attempts"] == te.ENGAGE_TOPIC_INVALID_MAX_ATTEMPTS
+
+
+def test_state_save_failure_is_reported_and_durable_reply_is_not_resent(tmp_path):
+    base_state = _two_chat_state()
+    base_state["telegram_engage_chats"] = []
+    replies = []
+
+    def run_once():
+        return te.run_telegram_engage_cycle(
+            drive_root=tmp_path,
+            load_state=lambda: json.loads(json.dumps(base_state)),
+            save_state=lambda _saved: (_ for _ in ()).throw(OSError("state down")),
+            fetch_candidates=lambda *_args, **_kwargs: _packets()["@chata"],
+            run_decider=lambda _prompt: _decision(
+                _assessment(1, "reply", text="sent once"),
+            ),
+            do_reply=lambda *args: replies.append(args) or True,
+            do_react=lambda *_args: True,
+            notify=lambda _text: None,
+            now=1000.0,
+        )
+
+    first = run_once()
+    second = run_once()
+
+    assert first["status"] == "acted"
+    for result in (first, second):
+        assert result["state_persisted"] is False
+        assert result["persistence_error"] == "state_save_failed"
+        assert result["reason"] == "state save failed"
+        assert result["retryable_failure"] is True
+    assert replies == [("@chata", 1, "sent once")]

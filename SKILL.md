@@ -110,10 +110,18 @@ currently reconcile delayed ACKs into its action log and caps.
 - **One assessment object per message, every message.** An empty, partial,
   duplicate, or truncated decider response is invalid: it quarantines that
   forum topic after bounded retries and must not consume the spool cursor.
+- **Transport topic identity is data, not inference.** Carry a real forum
+  topic root into `GroupInbox`; for Bot API trust `message_thread_id` only
+  when `is_topic_message` is explicitly true, and for Telethon require the
+  MTProto `forum_topic` flag before reading a thread root (topic-create events
+  remain explicit). Never turn an ordinary reply into a topic. Seed a newly
+  observed topic lane from the chat checkpoint before filtering candidates so
+  enabling lanes cannot replay pre-upgrade history.
 - **Group actions are durable intents.** Engage replies/reactions go through
   the SQLite outbox (`group_delivery.py`) — one intent per message+action,
-  dead-letter after exhausted retries. Do not bypass it with raw sends; that
-  reopens the duplicate/lost-answer window.
+  dead-letter after exhausted retries. Its startup path must keep legacy
+  schema migration idempotent and preserve distinct `msg_id=0` posts. Do not
+  bypass it with raw sends; that reopens the duplicate/lost-answer window.
 - **The entity glossary never contains the agent itself.** `remember_entity`
   rejects the agent's own name terms; chat claims stay untrusted provenance
   and never write self-identity.
@@ -132,6 +140,10 @@ currently reconcile delayed ACKs into its action log and caps.
   legacy boolean `add_message()` callback keeps its historical behavior.
 - **ACK means transport success.** Never mark a delivery `acked` when it is
   merely enqueued or selected for sending.
+- **A failed state checkpoint is a retryable cycle failure.** Inspect
+  `state_persisted`/`retryable_failure` in the engage result; do not treat an
+  action status alone as proof that the scheduler cursor was saved. Durable
+  group intent keys make the retry safe from a second send after an ACK.
 - **Owner identity is numeric and immutable.** Authorize optional private
   traffic only against the configured Telegram user ID; never a username or
   display name. This utility does not create a private engage route, and an

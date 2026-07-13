@@ -17,7 +17,7 @@ from telegram_presence.delivery import DeliveryState, MessageEnvelope
 from telegram_presence.inbox import GroupInbox
 from telegram_presence.outbox import DurableOutbox
 from telegram_presence.transports.bot_api import BotApiTransport
-from telegram_presence.transports.telethon import TelethonTransport
+from telegram_presence.transports.telethon import TelethonTransport, _message_topic_id
 from telegram_presence import engage as te
 
 
@@ -40,8 +40,9 @@ class _FakeHttp:
         return io.BytesIO(json.dumps(body).encode("utf-8"))
 
 
-def _bot_update(mid, text, uid=7, username="anatoli", chat="@examplechat"):
-    return {
+def _bot_update(mid, text, uid=7, username="anatoli", chat="@examplechat",
+                topic_id=None):
+    update = {
         "update_id": 1000 + mid,
         "message": {
             "message_id": mid,
@@ -51,6 +52,10 @@ def _bot_update(mid, text, uid=7, username="anatoli", chat="@examplechat"):
             "text": text,
         },
     }
+    if topic_id is not None:
+        update["message"]["message_thread_id"] = topic_id
+        update["message"]["is_topic_message"] = True
+    return update
 
 
 def test_bot_api_poll_feeds_inbox(tmp_path, monkeypatch):
@@ -65,6 +70,21 @@ def test_bot_api_poll_feeds_inbox(tmp_path, monkeypatch):
     assert rows and rows[0]["message_id"] == 11
     assert rows[0]["chat"] == "@examplechat"
     assert rows[0]["addressed"] is True
+
+
+def test_bot_api_preserves_only_real_forum_topic_ids(tmp_path, monkeypatch):
+    monkeypatch.setattr(hooks, "_state_loader",
+                        lambda: {"telegram_mentions_chat": "@examplechat"})
+    topic = _bot_update(18, "topic", topic_id=321)
+    ordinary_thread = _bot_update(19, "not a forum topic")
+    ordinary_thread["message"]["message_thread_id"] = 999
+    inbox = GroupInbox(tmp_path)
+    transport = BotApiTransport(
+        token="TESTTOKEN", inbox=inbox, http=_FakeHttp([topic, ordinary_thread])
+    )
+
+    assert transport.poll_updates() == 2
+    assert [row["topic_id"] for row in inbox.pending()] == [321, None]
 
 
 def test_bot_api_retains_offset_until_inbox_append_succeeds(tmp_path, monkeypatch):
@@ -308,6 +328,43 @@ class _FakeTelethonClient:
         self.sent.append(("raw_request", request))
 
 
+def test_telethon_topic_id_extraction_matches_live_bridge_contract():
+    class _TopicCreate:
+        pass
+
+    _TopicCreate.__name__ = "MessageActionTopicCreate"
+
+    assert _message_topic_id(type("M", (), {"reply_to_top_id": 41})()) is None
+    assert _message_topic_id(type("M", (), {
+        "reply_to_top_id": 41,
+        "reply_to": type("H", (), {"forum_topic": True})(),
+    })()) == 41
+    assert _message_topic_id(type("M", (), {
+        "reply_to": type("H", (), {
+            "forum_topic": True,
+            "reply_to_top_id": 42,
+        })(),
+    })()) == 42
+    assert _message_topic_id(type("M", (), {
+        "reply_to": type("H", (), {
+            "reply_to_top_id": None,
+            "forum_topic": True,
+            "reply_to_msg_id": 43,
+        })(),
+    })()) == 43
+    assert _message_topic_id(type("M", (), {
+        "reply_to": type("H", (), {
+            "reply_to_top_id": 99,
+            "forum_topic": False,
+            "reply_to_msg_id": 98,
+        })(),
+    })()) is None
+    assert _message_topic_id(type("M", (), {
+        "id": 44,
+        "action": _TopicCreate(),
+    })()) == 44
+
+
 def test_telethon_reply_is_anchored(tmp_path):
     client = _FakeTelethonClient()
     loop = asyncio.new_event_loop()
@@ -399,7 +456,12 @@ def test_telethon_event_feeds_inbox(tmp_path, monkeypatch):
         class _Msg:
             id = 21
             message = "@rain и как оно?"
-            reply_to_msg_id = None
+            reply_to_msg_id = 314
+            reply_to = type("H", (), {
+                "reply_to_top_id": None,
+                "forum_topic": True,
+                "reply_to_msg_id": 314,
+            })()
 
         class _Sender:
             id = 7
@@ -422,6 +484,7 @@ def test_telethon_event_feeds_inbox(tmp_path, monkeypatch):
         loop.run_until_complete(t.on_group_message(_Event()))
         rows = inbox.pending(after_ts=0.0)
         assert rows and rows[0]["message_id"] == 21 and rows[0]["addressed"] is True
+        assert rows[0]["topic_id"] == 314
     finally:
         loop.close()
 
